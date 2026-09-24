@@ -3794,6 +3794,13 @@ bool llama_context::hx_init() {
     if (llama_hx_env_int("LLAMA_HX", 0) <= 0) {
         return true;
     }
+    // MTP draft context: its model holds only the NextN block (blk.n_layer), whose routed experts run on the
+    // GPU through UEPT (one layer, ~10 experts per draft token). The HX engine and its mailboxes belong to the
+    // target context alone; a second engine here would oversubscribe the CPU expert threads.
+    if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+        LLAMA_LOG_INFO("%s: MTP draft context: HX off, NextN experts run through UEPT on the GPU\n", __func__);
+        return true;
+    }
     if (model.expert_exec() != LLAMA_EXPERT_EXEC_UEPT || model.arch != LLM_ARCH_QWEN4EXP) {
         LLAMA_LOG_ERROR("%s: LLAMA_HX requires --expert-exec uept and a qwen4exp model\n", __func__);
         return false;
