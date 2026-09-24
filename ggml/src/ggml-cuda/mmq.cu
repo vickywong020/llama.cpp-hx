@@ -2,6 +2,9 @@
 #include "mmq.cuh"
 #include "quantize.cuh"
 #include "mmid.cuh"
+#ifdef GGML_USE_HIP
+#include "uept.cuh"
+#endif
 
 #include <cstdint>
 
@@ -252,13 +255,19 @@ void ggml_cuda_mul_mat_q(
     }
 
     // Note that ne02 is used instead of ne12 because the number of y channels determines the z dimension of the CUDA grid.
-    const mmq_args args = {
+    mmq_args args = {
         src0_d, src0->type, (const int *) src1_q8_1.get(), ids_dst.get(), expert_bounds.get(), dst_d,
         src1_scale.ptr,
         ne00, ne01, ne_get_rows, s01, ne_get_rows, s1,
         ne02, ne02, s02, s12, s2,
         ne03, ne13, s03, s13, s3,
         ne12, ncols_opt};
+
+#ifdef GGML_USE_HIP
+    // Invariant 5: use the selected experts in a preallocated staging table without changing the cache directory.
+    // G-S2a's explicit gather mode reuses GPU expert bounds; direct mode returns the original directory table.
+    args.x_ptrs = ggml_cuda_uept_gather(ctx, src0, expert_bounds.get());
+#endif
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
 }

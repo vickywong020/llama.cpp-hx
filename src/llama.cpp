@@ -312,7 +312,39 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
     return true;
 }
 
-// Returns 0 on success, -1 on error, and -2 on cancellation via llama_progress_callback
+// Resolve the selected HIP device's mapped expert buffer without linking llama to HIP.
+static ggml_backend_buffer_type_t llama_uept_buffer_type(const llama_model_params & params, const llama_model & model) {
+    if (params.expert_exec == LLAMA_EXPERT_EXEC_LEGACY) {
+        return nullptr;
+    }
+    if (params.expert_exec != LLAMA_EXPERT_EXEC_UEPT) {
+        throw std::runtime_error("invalid expert execution mode");
+    }
+    if (model.devices.size() != 1 || params.split_mode == LLAMA_SPLIT_MODE_ROW || params.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
+        throw std::runtime_error("UEPT requires one HIP device and layer/none split mode; select --device ROCm0");
+    }
+    auto * dev = model.devices.front().dev;
+    auto * reg = ggml_backend_dev_backend_reg(dev);
+    using buffer_type_fn = ggml_backend_buffer_type_t (*)(int);
+    auto fn = (buffer_type_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_uept_buffer_type");
+    if (!fn || !ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_uept_init") ||
+            !ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_uept_reset") ||
+            !ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_uept_set_phase")) {
+        throw std::runtime_error(format("UEPT is unavailable on device %s; load a HIP backend built with UEPT", ggml_backend_dev_name(dev)));
+    }
+    for (size_t i = 0; i < ggml_backend_reg_dev_count(reg); ++i) {
+        if (ggml_backend_reg_dev_get(reg, i) == dev) {
+            auto * buft = fn((int) i);
+            if (buft) {
+                return buft;
+            }
+            break;
+        }
+    }
+    throw std::runtime_error("HIP backend could not create the UEPT buffer type");
+}
+
+// Returns 0 on success, -1 on error, and -2 on cancellation via llama_progress_callback.
 static std::pair<int, llama_model *> llama_model_load(struct gguf_context * metadata, llama_model_set_tensor_data_t set_tensor_data, void * set_tensor_data_ud,
         const std::string & fname, std::vector<std::string> & splits, FILE * file, llama_model_params & params) {
     try {
@@ -328,6 +360,8 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         if (!ok) {
             return {-1, nullptr};
         }
+
+        ml.expert_buft = llama_uept_buffer_type(params, *model_ptr);
 
         auto * model = dynamic_cast<llama_model_base *>(model_ptr.get());
         if (model == nullptr) {

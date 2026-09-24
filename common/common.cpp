@@ -1289,6 +1289,9 @@ struct common_init_result::impl {
 
 common_init_result::common_init_result(common_params & params, bool model_only) :
     pimpl(new impl{}) {
+    if (params.expert_exec == LLAMA_EXPERT_EXEC_UEPT && params.fit_params) {
+        throw std::invalid_argument("UEPT requires --fit off");
+    }
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
@@ -1684,6 +1687,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     }
 
     mparams.n_gpu_layers    = params.n_gpu_layers;
+    mparams.expert_exec     = params.expert_exec;
     mparams.main_gpu        = params.main_gpu;
     mparams.split_mode      = params.split_mode;
     mparams.load_mode       = params.load_mode;
@@ -1717,6 +1721,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
 
 struct llama_context_params common_context_params_to_llama(const common_params & params) {
     auto cparams = llama_context_default_params();
+    cparams.expert_cache_mib = params.expert_cache_mib;
 
     cparams.n_ctx             = params.n_ctx;
     cparams.n_seq_max         = params.n_parallel;

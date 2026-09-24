@@ -93,6 +93,7 @@ struct llama_cross {
 };
 
 struct llm_graph_params;
+struct llama_hx_state;
 
 //
 // llm_graph_input
@@ -786,6 +787,7 @@ struct llm_graph_params {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
+    const llama_hx_state         * hx;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -880,7 +882,8 @@ struct llm_graph_params {
             gtype == other.gtype &&
             cvec  == other.cvec  &&
             loras == other.loras &&
-            cross == other.cross;
+            cross == other.cross &&
+            hx    == other.hx;
     }
 };
 
@@ -1026,6 +1029,7 @@ struct llm_graph_context {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
+    const llama_hx_state         * hx;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -1156,6 +1160,14 @@ struct llm_graph_context {
              ggml_tensor * gate_exps_s = nullptr,
              ggml_tensor * down_exps_s = nullptr,
              ggml_tensor * selected_experts_in = nullptr) const;
+
+    // hybrid CPU/GPU MoE (r9 HX): if moe_out is the posted routed-expert task, return the node that waits
+    // for its result; otherwise return moe_out unchanged. Call after the work that should overlap with the
+    // CPU experts (e.g. the shared expert) has been added to the graph.
+    ggml_tensor * build_moe_hx_finish(ggml_tensor * moe_out, int il) const;
+
+    // H2/H3: GPU partial sum of the routed experts per layer, consumed by build_moe_hx_finish
+    mutable std::map<int, ggml_tensor *> hx_gpu_part;
 
     //
     // inputs

@@ -172,6 +172,32 @@ static void test(void) {
 
     std::vector<std::string> argv;
 
+    {
+        const auto defaults = llama_model_default_params();
+        assert(defaults.expert_exec == LLAMA_EXPERT_EXEC_LEGACY);
+        assert(llama_context_default_params().expert_cache_mib == -1);
+
+        auto check_expert_args = [&](std::vector<std::string> args, bool valid, int64_t cache_mib = -1) {
+            common_params expert_params;
+            const bool parsed = common_params_parse(args.size(), list_str_to_char(args).data(), expert_params, LLAMA_EXAMPLE_SERVER);
+            assert(parsed == valid);
+            if (parsed) {
+                assert(expert_params.expert_exec == LLAMA_EXPERT_EXEC_UEPT);
+                assert(!expert_params.fit_params);
+                assert(common_model_params_to_llama(expert_params).expert_exec == LLAMA_EXPERT_EXEC_UEPT);
+                assert(common_context_params_to_llama(expert_params).expert_cache_mib == cache_mib);
+            }
+        };
+        check_expert_args({"test", "--expert-exec", "unknown"}, false);
+        check_expert_args({"test", "--expert-exec", "uept"}, false);
+        check_expert_args({"test", "--expert-exec", "uept", "--fit", "off"}, true);
+        check_expert_args({"test", "--fit", "off", "--expert-exec", "uept", "--expert-cache-mib", "0"}, true, 0);
+        check_expert_args({"test", "--expert-exec", "uept", "--fit", "off", "--expert-cache-mib", "1024"}, true, 1024);
+        check_expert_args({"test", "--expert-exec", "uept", "--fit", "off", "--expert-cache-mib", "-2"}, false);
+        check_expert_args({"test", "--expert-exec", "uept", "--fit", "off", "--expert-cache-mib", "12MiB"}, false);
+        check_expert_args({"test", "--expert-exec", "uept", "--fit", "off", "--expert-cache-mib", "9223372036854775807"}, false);
+    }
+
     printf("test-arg-parser: test invalid usage\n\n");
 
     // missing value

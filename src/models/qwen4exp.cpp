@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <cstdlib>
 
 // bad metadata must be catchable: GGML_ASSERT aborts the whole process
 static void qwen4exp_require_nonzero(const llama_model_loader & ml, llm_kv kid, uint32_t value) {
@@ -761,6 +762,33 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
+    const char * gather_env = std::getenv("QWEN4EXP_QSA_GATHER");
+    const bool gather_decode = gather_env && std::atoi(gather_env) != 0 && cparams.flash_attn &&
+        q->ne[2] == 1 && k->ne[3] == 1 && top_k->ne[1] == 1 && top_k->ne[3] == 1 &&
+        k->ne[2] > 2 * top_k->ne[0] &&
+        k->nb[1] == ggml_row_size(k->type, k->ne[0]) &&
+        v->nb[1] == ggml_row_size(v->type, v->ne[0]);
+    if (gather_decode) {
+        const int64_t n_selected = top_k->ne[0];
+        ggml_tensor * indices = ggml_reshape_1d(ctx0, top_k, n_selected);
+        auto gather_cache = [&](ggml_tensor * cache) {
+            ggml_tensor * rows = ggml_view_2d(ctx0, cache, cache->ne[0] * cache->ne[1],
+                    cache->ne[2], cache->nb[2], 0);
+            rows = ggml_get_rows(ctx0, rows, indices);
+            return ggml_reshape_4d(ctx0, rows, cache->ne[0], cache->ne[1], n_selected, 1);
+        };
+        ggml_tensor * mask_rows = ggml_view_2d(ctx0, kq_mask_top_k, 1, kq_mask_top_k->ne[0],
+                kq_mask_top_k->nb[0], 0);
+        ggml_tensor * selected_mask = ggml_get_rows(ctx0, mask_rows, indices);
+        selected_mask = ggml_cast(ctx0, ggml_reshape_4d(ctx0, selected_mask, n_selected, 1, 1, 1), GGML_TYPE_F16);
+        k = gather_cache(k);
+        v = gather_cache(v);
+        kq_mask_top_k = selected_mask;
+        cb(k, "qsa_gather_k", il);
+        cb(v, "qsa_gather_v", il);
+    }
+
+
     ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, top_k->ne[0], kq_scale, il);
     cb(cur, "kqv_out", il);
 
@@ -1026,10 +1054,14 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
         ffn_shexp = ggml_mul(ctx0, ffn_shexp, shared_gate);
         cb(ffn_shexp, "ffn_shexp_gated", il);
 
+        // r9 HX: the shared expert runs on the GPU while the CPU engine computes the routed experts
+        ggml_build_forward_expand(gf, ffn_shexp);
+        moe_out = build_moe_hx_finish(moe_out, il);
+
         cur = ggml_add(ctx0, moe_out, ffn_shexp);
         cb(cur, "ffn_out", il);
     } else {
-        cur = moe_out;
+        cur = build_moe_hx_finish(moe_out, il);
     }
 
     return cur;

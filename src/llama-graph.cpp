@@ -1,4 +1,5 @@
 #include "llama-graph.h"
+#include "llama-hx.h"
 
 #include "llama-impl.h"
 #include "llama-model.h"
@@ -1489,6 +1490,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     loras            (params.loras),
     mctx             (params.mctx),
     cross            (params.cross),
+    hx               (params.hx),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
@@ -1990,6 +1992,82 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     );
 }
 
+// hybrid CPU/GPU MoE (r9 HX): CPU fallbacks of the two GGML_OP_CUSTOM nodes. On the HIP backend the same
+// nodes are executed by ggml-cuda/hx.cu (mailbox post + bounded wait); these run only if the scheduler
+// places them on the CPU backend.
+static void llama_hx_post_cpu(ggml_tensor * dst, int ith, int nth, void * userdata) {
+    GGML_UNUSED(nth);
+    if (ith != 0) {
+        return;
+    }
+    static bool warned = false;
+    if (!warned) {
+        warned = true;
+        LLAMA_LOG_WARN("%s: HX routed experts are running through the synchronous CPU fallback\n", __func__);
+    }
+    const auto * op = (const ggml_hx_op *) userdata;
+    const ggml_tensor * x   = dst->src[0];
+    const ggml_tensor * ids = dst->src[1];
+    const ggml_tensor * w   = dst->src[2];
+    op->cpu_compute(op->cpu_engine, op->layer,
+        (const float *) x->data, x->nb[1] / sizeof(float),
+        (const int32_t *) ids->data, ids->nb[1] / sizeof(int32_t),
+        (const float *) w->data, w->nb[1] / sizeof(float),
+        (int) x->ne[1], (int) ids->ne[0], (float *) dst->data, dst->nb[1] / sizeof(float));
+}
+
+static void llama_hx_wait_cpu(ggml_tensor * dst, int ith, int nth, void * userdata) {
+    GGML_UNUSED(nth);
+    GGML_UNUSED(userdata);
+    if (ith != 0) {
+        return;
+    }
+    const ggml_tensor * src = dst->src[0];
+    const ggml_tensor * gpu = dst->src[1];
+    for (int64_t t = 0; t < dst->ne[1]; ++t) {
+        float * d = (float *) ((char *) dst->data + t * dst->nb[1]);
+        const float * a = (const float *) ((const char *) src->data + t * src->nb[1]);
+        const float * b = gpu ? (const float *) ((const char *) gpu->data + t * gpu->nb[1]) : nullptr;
+        for (int64_t c = 0; c < dst->ne[0]; ++c) {
+            d[c] = b ? a[c] + b[c] : a[c];
+        }
+    }
+}
+
+// CPU fallback of the H2/H3 reorder: no directory is visible here, so the top-weighted experts go to the GPU part.
+static void llama_hx_reorder_cpu(ggml_tensor * dst, int ith, int nth, void * userdata) {
+    GGML_UNUSED(nth);
+    GGML_UNUSED(userdata);
+    if (ith != 0) {
+        return;
+    }
+    const ggml_tensor * src = dst->type == GGML_TYPE_I32 ? dst->src[0] : dst->src[1];
+    for (int64_t t = 0; t < dst->ne[1]; ++t) {
+        memcpy((char *) dst->data + t * dst->nb[1], (const char *) src->data + t * src->nb[1], dst->ne[0] * ggml_type_size(dst->type));
+    }
+}
+
+ggml_tensor * llm_graph_context::build_moe_hx_finish(ggml_tensor * moe_out, int il) const {
+    if (hx == nullptr || moe_out == nullptr || moe_out->op != GGML_OP_CUSTOM) {
+        return moe_out;
+    }
+    ggml_custom_op_t fun = nullptr;
+    memcpy(&fun, moe_out->op_params, sizeof(fun));
+    if (fun != llama_hx_post_cpu) {
+        return moe_out;
+    }
+    ggml_tensor * gpu_part = nullptr;
+    auto it = hx_gpu_part.find(il);
+    if (it != hx_gpu_part.end()) {
+        gpu_part = it->second;
+    }
+    ggml_tensor * args[2] = { moe_out, gpu_part };
+    ggml_tensor * res = ggml_custom_4d(ctx0, GGML_TYPE_F32, moe_out->ne[0], moe_out->ne[1], 1, 1, args, gpu_part ? 2 : 1,
+            llama_hx_wait_cpu, 1, (void *) &hx->layers[il].wait);
+    cb(res, "ffn_moe_hx_wait", il);
+    return res;
+}
+
 ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * cur,
          ggml_tensor * gate_inp,
@@ -2153,6 +2231,67 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     //call early so that topk-moe can be used
     ggml_build_forward_expand(gf, weights);
+
+    // hybrid CPU/GPU MoE (r9 HX): hand the routed experts of small ubatches to the CPU engine
+    if (hx != nullptr && arch == LLM_ARCH_QWEN4EXP && hx->enabled(il, n_tokens, n_expert_used) &&
+        !weight_before_ffn && gate_exps && up_exps && down_exps && !gate_up_exps &&
+        !up_exps_b && !gate_exps_b && !down_exps_b && !up_exps_s && !gate_exps_s && !down_exps_s &&
+        type_op == LLM_FFN_SILU && hparams.swiglu_clamp_exp[il] <= 1e-6f && (loras == nullptr || loras->empty()) &&
+        selected_experts->type == GGML_TYPE_I32 && selected_experts->nb[0] == sizeof(int32_t) &&
+        cur->nb[0] == sizeof(float) && cur->type == GGML_TYPE_F32) {
+        ggml_tensor * w2 = ggml_is_contiguous(weights) ? weights : ggml_cont(ctx0, weights);
+        w2 = ggml_reshape_2d(ctx0, w2, n_expert_used, n_tokens);
+        const int n_gpu = (int) std::min<int64_t>(hx->n_gpu, n_expert_used - 1);
+        ggml_tensor * cpu_ids = selected_experts;
+        ggml_tensor * cpu_w   = w2;
+        ggml_tensor * gpu_ids = nullptr;
+        ggml_tensor * gpu_w   = nullptr;
+        if (n_gpu > 0) {
+            // H2/H3: GPU-first permutation (VRAM cache hits, then top-weighted misses) decided on the device
+            ggml_tensor * rargs[3] = { selected_experts, up_exps, nullptr };
+            ggml_tensor * ids_r = ggml_custom_4d(ctx0, GGML_TYPE_I32, n_expert_used, n_tokens, 1, 1, rargs, 2,
+                    llama_hx_reorder_cpu, 1, (void *) &hx->layers[il].reorder_ids);
+            cb(ids_r, "ffn_moe_hx_ids", il);
+            ggml_tensor * wargs[3] = { selected_experts, w2, up_exps };
+            ggml_tensor * w_r = ggml_custom_4d(ctx0, GGML_TYPE_F32, n_expert_used, n_tokens, 1, 1, wargs, 3,
+                    llama_hx_reorder_cpu, 1, (void *) &hx->layers[il].reorder_w);
+            cb(w_r, "ffn_moe_hx_w", il);
+            gpu_ids = ggml_cont(ctx0, ggml_view_2d(ctx0, ids_r, n_gpu, n_tokens, ids_r->nb[1], 0));
+            gpu_w   = ggml_cont(ctx0, ggml_view_2d(ctx0, w_r,   n_gpu, n_tokens, w_r->nb[1],   0));
+            cpu_ids = ggml_view_2d(ctx0, ids_r, n_expert_used - n_gpu, n_tokens, ids_r->nb[1], n_gpu * ids_r->nb[0]);
+            cpu_w   = ggml_view_2d(ctx0, w_r,   n_expert_used - n_gpu, n_tokens, w_r->nb[1],   n_gpu * w_r->nb[0]);
+        }
+        ggml_tensor * args[6] = { cur, cpu_ids, cpu_w, gate_exps, up_exps, down_exps };
+        ggml_tensor * post = ggml_custom_4d(ctx0, GGML_TYPE_F32, n_embd, n_tokens, 1, 1, args, 6,
+                llama_hx_post_cpu, 1, (void *) &hx->layers[il].post);
+        cb(post, "ffn_moe_hx_post", il);
+        ggml_build_forward_expand(gf, post);
+        if (n_gpu > 0) {
+            // GPU part of the routed experts, computed while the CPU engine works on the rest
+            ggml_tensor * x3 = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
+            ggml_tensor * g_up   = build_lora_mm_id(up_exps,   x3, gpu_ids, nullptr); // [n_ff, n_gpu, n_tokens]
+            cb(g_up, "ffn_moe_hx_gpu_up", il);
+            ggml_tensor * g_gate = build_lora_mm_id(gate_exps, x3, gpu_ids, nullptr);
+            cb(g_gate, "ffn_moe_hx_gpu_gate", il);
+            ggml_tensor * g_act  = ggml_swiglu_split(ctx0, g_gate, g_up);
+            cb(g_act, "ffn_moe_hx_gpu_swiglu", il);
+            ggml_tensor * g_down = build_lora_mm_id(down_exps, g_act, gpu_ids, nullptr); // [n_embd, n_gpu, n_tokens]
+            cb(g_down, "ffn_moe_hx_gpu_down", il);
+            g_down = ggml_mul(ctx0, g_down, ggml_reshape_3d(ctx0, gpu_w, 1, n_gpu, n_tokens));
+            cb(g_down, "ffn_moe_hx_gpu_weighted", il);
+            ggml_tensor * g_sum = ggml_view_2d(ctx0, g_down, n_embd, n_tokens, g_down->nb[2], 0);
+            for (int k = 1; k < n_gpu; ++k) {
+                g_sum = ggml_add(ctx0, g_sum, ggml_view_2d(ctx0, g_down, n_embd, n_tokens, g_down->nb[2], k * g_down->nb[1]));
+            }
+            if (n_gpu == 1) {
+                g_sum = ggml_cont(ctx0, g_sum);
+            }
+            cb(g_sum, "ffn_moe_hx_gpu_out", il);
+            ggml_build_forward_expand(gf, g_sum);
+            hx_gpu_part[il] = g_sum;
+        }
+        return post;
+    }
 
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
 

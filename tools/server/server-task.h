@@ -73,6 +73,7 @@ struct task_params {
     std::vector<std::string> response_fields;
 
     bool timings_per_token   = false;
+    bool decode_step_timings = false;
     bool post_sampling_probs = false;
 
     struct common_params_sampling sampling;
@@ -320,6 +321,7 @@ struct completion_token_output {
 struct server_task_result_cmpl_final : server_task_result {
     std::string content;
     llama_tokens tokens;
+    std::vector<int64_t> decode_step_us;
 
     bool stream;
     bool include_usage;

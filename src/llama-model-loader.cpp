@@ -1208,6 +1208,40 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             }
         }
 
+        if (expert_buft) {
+            const bool weight = tn.suffix && strcmp(tn.suffix, "weight") == 0;
+            const bool routed = weight && (tn_tensor == LLM_TENSOR_FFN_GATE_EXPS || tn_tensor == LLM_TENSOR_FFN_UP_EXPS ||
+                                           tn_tensor == LLM_TENSOR_FFN_DOWN_EXPS);
+            const bool ple = tn_tensor == LLM_TENSOR_PER_LAYER_TOKEN_EMBD;
+            if (weight && tn_tensor == LLM_TENSOR_FFN_GATE_UP_EXPS) {
+                throw std::runtime_error("UEPT requires separate gate and up expert tensors");
+            }
+            if (routed || ple) {
+                const std::string name = tn.str();
+                if (tensor_buft_overrides) {
+                    for (auto * entry = tensor_buft_overrides; entry->pattern; ++entry) {
+                        if (std::regex_search(name, std::regex(entry->pattern)) &&
+                                (routed || entry->buft != ggml_backend_cpu_buffer_type())) {
+                            throw std::runtime_error(format("UEPT placement conflicts with tensor override '%s' for %s", entry->pattern, name.c_str()));
+                        }
+                    }
+                }
+                if (ple) {
+                    return is_lazy ? lazy_read::buft() : ggml_backend_cpu_buffer_type();
+                }
+                if (t_meta->type != GGML_TYPE_Q4_K && t_meta->type != GGML_TYPE_Q5_K &&
+                        t_meta->type != GGML_TYPE_Q5_1 && t_meta->type != GGML_TYPE_Q6_K &&
+                        t_meta->type != GGML_TYPE_Q8_0 && t_meta->type != GGML_TYPE_MXFP4) {
+                    throw std::runtime_error(format("UEPT does not support expert tensor %s with type %s", name.c_str(), ggml_type_name(t_meta->type)));
+                }
+                if (t_meta->ne[2] <= 1) {
+                    throw std::runtime_error(format("UEPT requires a 3D routed expert weight tensor: %s", name.c_str()));
+                }
+                is_lazy = false;
+                return expert_buft;
+            }
+        }
+
         if (is_lazy) {
             return lazy_read::buft();
         }

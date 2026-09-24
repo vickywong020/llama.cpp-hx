@@ -7,6 +7,7 @@
 #include "llama-adapter.h"
 #include "llama-impl.h"
 #include "llama-memory.h"
+#include "llama-hx.h"
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
@@ -57,6 +58,11 @@ struct llama_context {
     void sched_reserve();
 
     void synchronize();
+
+    bool expert_cache_init(int64_t cache_mib);
+    bool hx_init();
+    void expert_cache_reset();
+    void expert_cache_set_phase(llama_expert_phase phase);
 
     const llama_model   & get_model()   const;
     const llama_cparams & get_cparams() const;
@@ -255,6 +261,8 @@ public:
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
 private:
+    void expert_cache_apply_phase();
+
     llm_graph_result * get_gf_res_prev();
 
     llm_graph_params graph_params(
@@ -283,6 +291,7 @@ private:
     const llama_model & model;
 
     llama_cparams cparams;
+    llama_expert_phase expert_phase = LLAMA_EXPERT_PHASE_DECODE;
 
     llama_adapter_cvec_ptr  cvec;
     llama_adapter_loras_ptr loras;
@@ -398,4 +407,7 @@ private:
     mutable int32_t n_eval   = 0; // number of eval calls
 
     mutable int32_t n_reused = 0; // number of times the previous graph was reused
+
+    // hybrid CPU/GPU MoE (r9 HX), env LLAMA_HX=1 with --expert-exec uept
+    std::unique_ptr<llama_hx_state> hx;
 };

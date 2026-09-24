@@ -1,6 +1,7 @@
 #include "ggml-backend.h"
 #include "ggml-backend-impl.h"
 #include "ggml-cpu.h"
+#include "ggml-hx.h"
 #include "repack.h"
 #include "traits.h"
 #include "ggml-impl.h"
@@ -652,6 +653,14 @@ static ggml_backend_feature * ggml_backend_cpu_get_features(ggml_backend_reg_t r
     GGML_UNUSED(reg);
 }
 
+extern "C" {
+void * ggml_backend_cpu_hx_start(struct ggml_hx_layer_desc * layers, int n_layers, int n_threads);
+void   ggml_backend_cpu_hx_stop(void * engine);
+void   ggml_backend_cpu_hx_compute(void * engine, int layer, const float * x, int64_t x_stride, const int32_t * ids, int64_t ids_stride, const float * w, int64_t w_stride, int n_tokens, int n_used, float * y, int64_t y_stride);
+void   ggml_backend_cpu_hx_stats(void * engine, uint64_t * out);
+void   ggml_backend_cpu_hx_set_router(void * engine, int layer, const float * w, int64_t n_embd, int64_t n_expert);
+}
+
 static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     if (strcmp(name, "ggml_backend_set_n_threads") == 0) {
         ggml_backend_set_n_threads_t fct = ggml_backend_cpu_set_n_threads;
@@ -675,6 +684,23 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (strcmp(name, "ggml_backend_cpu_set_use_ref") == 0) {
         return (void *)ggml_backend_cpu_set_use_ref;
+    }
+
+    // hybrid CPU/GPU MoE engine (ggml-hx.h)
+    if (strcmp(name, "ggml_backend_cpu_hx_start") == 0) {
+        return (void *)ggml_backend_cpu_hx_start;
+    }
+    if (strcmp(name, "ggml_backend_cpu_hx_stop") == 0) {
+        return (void *)ggml_backend_cpu_hx_stop;
+    }
+    if (strcmp(name, "ggml_backend_cpu_hx_compute") == 0) {
+        return (void *)ggml_backend_cpu_hx_compute;
+    }
+    if (strcmp(name, "ggml_backend_cpu_hx_stats") == 0) {
+        return (void *)ggml_backend_cpu_hx_stats;
+    }
+    if (strcmp(name, "ggml_backend_cpu_hx_set_router") == 0) {
+        return (void *)ggml_backend_cpu_hx_set_router;
     }
 
     // threadpool - TODO:  move to ggml-base

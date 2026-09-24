@@ -2236,6 +2236,11 @@ bool llama_model::has_tensor_overrides() const {
     return pimpl->has_tensor_overrides;
 }
 
+// Return the immutable expert execution mode selected at model load.
+llama_expert_exec llama_model::expert_exec() const {
+    return params.expert_exec;
+}
+
 const ggml_tensor * llama_model::get_tensor(const char * name) const {
     auto it = std::find_if(tensors_by_name.begin(), tensors_by_name.end(),
             [name](const std::pair<std::string, ggml_tensor *> & it) {
@@ -2792,6 +2797,7 @@ llama_model_params llama_model_default_params() {
         /*.split_mode                  =*/ LLAMA_SPLIT_MODE_LAYER,
         /*.load_mode                   =*/ LLAMA_LOAD_MODE_AUTO,
         /*.lazy_mode                   =*/ LLAMA_LAZY_MODE_AUTO,
+        /*.expert_exec                 =*/ LLAMA_EXPERT_EXEC_LEGACY,
         /*.main_gpu                    =*/ 0,
         /*.tensor_split                =*/ nullptr,
         /*.progress_callback           =*/ nullptr,

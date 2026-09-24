@@ -20,6 +20,9 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
     add((new field_bool("timings_per_token", params.timings_per_token))
         ->set_desc("Include prompt processing and text generation speed information in each response"));
 
+    add((new field_bool("decode_step_timings", params.decode_step_timings))
+        ->set_desc("Return internal decode-step microseconds in the final native completion response; requires one slot, no speculation, and n_predict between 2 and 8193"));
+
     add((new field_bool("stream", params.stream))
         ->set_desc("Allows receiving each predicted token in real-time instead of waiting for the completion to finish"));
 

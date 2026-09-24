@@ -877,6 +877,10 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
     // parse all CLI args now, so that -hf is available below for remote preset resolution
     parse_cli_args();
 
+    if (params.expert_exec == LLAMA_EXPERT_EXEC_UEPT && params.fit_params) {
+        throw std::invalid_argument("error: --expert-exec uept requires --fit off\n");
+    }
+
     postprocess_cpu_params(params.cpuparams,       nullptr);
     postprocess_cpu_params(params.cpuparams_batch, &params.cpuparams);
 
@@ -2780,6 +2784,32 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             llm_add_n_cpu_ffn_overrides(value, LLM_FFN_DENSE_REGEX, params.tensor_buft_overrides);
         }
     ).set_env("LLAMA_ARG_N_CPU_FFN"));
+    add_opt(common_arg(
+        { "--expert-exec" }, "legacy|uept",
+        "routed expert execution mode (default: legacy); uept requires --fit off and one HIP device",
+        [](common_params & params, const std::string & value) {
+            if (value == "legacy") {
+                params.expert_exec = LLAMA_EXPERT_EXEC_LEGACY;
+            } else if (value == "uept") {
+                params.expert_exec = LLAMA_EXPERT_EXEC_UEPT;
+            } else {
+                throw std::invalid_argument("--expert-exec must be legacy or uept");
+            }
+        }
+    ).set_env("LLAMA_ARG_EXPERT_EXEC"));
+    add_opt(common_arg(
+        { "--expert-cache-mib" }, "N",
+        "UEPT cache limit in MiB: -1 = available VRAM minus 1 GiB, 0 = disabled (default: -1)",
+        [](common_params & params, const std::string & value) {
+            size_t end = 0;
+            const int64_t mib = std::stoll(value, &end);
+            if (end != value.size() || mib < -1 || mib > INT64_MAX / (1024 * 1024)) {
+                throw std::invalid_argument("--expert-cache-mib must be -1 or a nonnegative MiB count");
+            }
+            params.expert_cache_mib = mib;
+        }
+    ).set_env("LLAMA_ARG_EXPERT_CACHE_MIB"));
+
     GGML_ASSERT(params.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0
     add_opt(common_arg(
         {"-ngl", "--gpu-layers", "--n-gpu-layers"}, "N",

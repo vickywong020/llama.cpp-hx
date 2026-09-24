@@ -13,7 +13,9 @@
 #include "llama-sampler.h"
 #include "llama.h"
 
+#include <algorithm>
 #include <cinttypes>
+#include <memory>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -461,6 +463,10 @@ llama_context::llama_context(
 
         sched_reserve();
 
+        if (!expert_cache_init(params.expert_cache_mib)) {
+            throw std::runtime_error("failed to initialize UEPT expert cache");
+        }
+
         if (!cparams.flash_attn) {
             if (ggml_is_quantized(params.type_v)) {
                 throw std::runtime_error("quantized V cache was requested, but this requires Flash Attention");
@@ -482,6 +488,9 @@ llama_context::llama_context(
 llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
+
+    // stop the HX CPU engine before the backends and the model go away
+    hx.reset();
 
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
     if (!model.hparams.no_alloc && !opt_ctx) {
@@ -1716,6 +1725,13 @@ int llama_context::decode(const llama_batch & batch_inp) {
         return -1;
     }
 
+    // Apply the caller's phase before splitting; a short prompt tail is still prefill (invariant 5).
+    expert_cache_apply_phase();
+
+    if (hx && hx->timeouts() > 0) {
+        GGML_ABORT("HX: the CPU expert engine did not deliver a result within 1 s (%d layers); outputs are invalid", hx->timeouts());
+    }
+
     const auto & vocab   = model.vocab;
     const auto & hparams = model.hparams;
 
@@ -2559,6 +2575,7 @@ llm_graph_params llama_context::graph_params(
         /*.loras       =*/ loras.get(),
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
+        /*.hx          =*/ hx.get(),
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
@@ -3692,6 +3709,302 @@ void llama_context::opt_epoch(
 // interface implementation
 //
 
+// Rebuild per-context expert directories only after KV and compute buffers have been reserved.
+bool llama_context::expert_cache_init(int64_t cache_mib) {
+    if (model.expert_exec() == LLAMA_EXPERT_EXEC_LEGACY || model.hparams.no_alloc || model.hparams.vocab_only) {
+        return true;
+    }
+    if (cache_mib < -1 || cache_mib > INT64_MAX / (1024 * 1024)) {
+        LLAMA_LOG_ERROR("%s: expert cache MiB must be -1 or a nonnegative size\n", __func__);
+        return false;
+    }
+    std::vector<const ggml_tensor *> tensors;
+    for (const auto & named : model.tensors_by_name) {
+        auto * tensor = named.second;
+        if (tensor->buffer && strstr(ggml_backend_buffer_name(tensor->buffer), "UEPT")) {
+            tensors.push_back(tensor);
+        }
+    }
+    if (tensors.empty()) {
+        LLAMA_LOG_ERROR("%s: UEPT model contains no mapped expert tensors\n", __func__);
+        return false;
+    }
+    bool initialized = false;
+    for (auto & backend : backends) {
+        auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend.get()));
+        using init_fn = bool (*)(ggml_backend_t, const ggml_tensor * const *, size_t, int64_t);
+        auto fn = (init_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_uept_init");
+        if (fn) {
+            if (!fn(backend.get(), tensors.data(), tensors.size(), cache_mib)) {
+                return false;
+            }
+            initialized = true;
+        }
+    }
+    if (!initialized) {
+        LLAMA_LOG_ERROR("%s: selected backend has no UEPT initialization entry point\n", __func__);
+    } else {
+        expert_cache_apply_phase();
+        if (!hx_init()) {
+            return false;
+        }
+    }
+    return initialized;
+}
+
+//
+// hybrid CPU/GPU MoE (r9 HX)
+//
+
+int llama_hx_state::timeouts() const {
+    int n = 0;
+    auto * mb = (const ggml_hx_mailbox *) mbox_host;
+    for (int i = 0; mb && i < n_mbox; ++i) {
+        n += ((const volatile uint32_t *) &mb[i].gpu_timeout)[0] != 0;
+    }
+    return n;
+}
+
+llama_hx_state::~llama_hx_state() {
+    if (engine && engine_stop) {
+        if (engine_stats) {
+            uint64_t st[4] = {};
+            engine_stats(engine, st);
+            LLAMA_LOG_INFO("%s: HX engine: %llu tasks, %.1f ms busy, %llu idle sleeps\n", __func__,
+                (unsigned long long) st[0], st[1] / 1e6, (unsigned long long) st[3]);
+        }
+        engine_stop(engine);
+    }
+    engine = nullptr;
+    if (mbox_host && mbox_free) {
+        mbox_free(mbox_host);
+    }
+    mbox_host = nullptr;
+}
+
+static int llama_hx_env_int(const char * name, int def) {
+    const char * v = getenv(name);
+    return v && *v ? atoi(v) : def;
+}
+
+bool llama_context::hx_init() {
+    if (hx) {
+        return true;
+    }
+    if (llama_hx_env_int("LLAMA_HX", 0) <= 0) {
+        return true;
+    }
+    if (model.expert_exec() != LLAMA_EXPERT_EXEC_UEPT || model.arch != LLM_ARCH_QWEN4EXP) {
+        LLAMA_LOG_ERROR("%s: LLAMA_HX requires --expert-exec uept and a qwen4exp model\n", __func__);
+        return false;
+    }
+
+    auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    if (!cpu_dev) {
+        LLAMA_LOG_ERROR("%s: no CPU backend\n", __func__);
+        return false;
+    }
+    auto * cpu_reg = ggml_backend_dev_backend_reg(cpu_dev);
+    using start_fn = void * (*)(ggml_hx_layer_desc *, int, int);
+    auto start   = (start_fn) ggml_backend_reg_get_proc_address(cpu_reg, "ggml_backend_cpu_hx_start");
+    auto stop    = (void (*)(void *)) ggml_backend_reg_get_proc_address(cpu_reg, "ggml_backend_cpu_hx_stop");
+    auto compute = (ggml_hx_cpu_compute_t) ggml_backend_reg_get_proc_address(cpu_reg, "ggml_backend_cpu_hx_compute");
+    auto stats   = (void (*)(void *, uint64_t *)) ggml_backend_reg_get_proc_address(cpu_reg, "ggml_backend_cpu_hx_stats");
+    if (!start || !stop || !compute) {
+        LLAMA_LOG_ERROR("%s: the loaded CPU backend has no HX engine; rebuild the CPU backend\n", __func__);
+        return false;
+    }
+
+    using alloc_fn = bool (*)(ggml_backend_t, size_t, void **, void **);
+    alloc_fn alloc = nullptr;
+    void (*mfree)(void *) = nullptr;
+    ggml_backend_t gpu = nullptr;
+    for (auto & backend : backends) {
+        auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend.get()));
+        auto a = (alloc_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_hx_alloc");
+        if (a) {
+            alloc = a;
+            mfree = (void (*)(void *)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_hx_free");
+            gpu = backend.get();
+            break;
+        }
+    }
+    if (!alloc || !mfree) {
+        LLAMA_LOG_ERROR("%s: the loaded HIP backend has no HX entry points; rebuild ggml-hip\n", __func__);
+        return false;
+    }
+
+    const int n_layer = (int) model.hparams.n_layer();
+    auto st = std::make_unique<llama_hx_state>();
+    void * host = nullptr;
+    void * dev  = nullptr;
+    if (!alloc(gpu, sizeof(ggml_hx_mailbox) * (size_t) n_layer, &host, &dev)) {
+        return false;
+    }
+    st->mbox_host = host;
+    st->n_mbox    = n_layer;
+    st->mbox_free = mfree;
+
+    auto is_uept = [](const ggml_tensor * t) {
+        return t && t->buffer && strstr(ggml_backend_buffer_name(t->buffer), "UEPT") != nullptr;
+    };
+
+    std::vector<ggml_hx_layer_desc> desc(n_layer);
+    int n_ok = 0;
+    for (int il = 0; il < n_layer; ++il) {
+        desc[il] = {};
+        const auto & L = model.layers[il];
+        const ggml_tensor * g = L.ffn_gate_exps;
+        const ggml_tensor * u = L.ffn_up_exps;
+        const ggml_tensor * d = L.ffn_down_exps;
+        if (!is_uept(g) || !is_uept(u) || !is_uept(d) || L.ffn_gate_up_exps ||
+                L.ffn_up_exps_s || L.ffn_gate_exps_s || L.ffn_down_exps_s) {
+            continue;
+        }
+        if (u->ne[0] != g->ne[0] || u->ne[1] != g->ne[1] || u->ne[2] != g->ne[2] ||
+                d->ne[0] != g->ne[1] || d->ne[1] != g->ne[0] || d->ne[2] != g->ne[2] ||
+                g->ne[0] > GGML_HX_MAX_EMBD) {
+            continue;
+        }
+        auto & D = desc[il];
+        D.mbox      = (ggml_hx_mailbox *) host + il;
+        D.gate      = g->data;
+        D.up        = u->data;
+        D.down      = d->data;
+        D.type_gate = g->type;
+        D.type_up   = u->type;
+        D.type_down = d->type;
+        D.n_expert  = (int32_t) g->ne[2];
+        D.n_embd    = g->ne[0];
+        D.n_ff      = g->ne[1];
+        D.gate_nb1  = g->nb[1]; D.gate_nb2 = g->nb[2];
+        D.up_nb1    = u->nb[1]; D.up_nb2   = u->nb[2];
+        D.down_nb1  = d->nb[1]; D.down_nb2 = d->nb[2];
+        ++n_ok;
+    }
+    if (n_ok == 0) {
+        LLAMA_LOG_ERROR("%s: no layer qualifies for HX (experts must be in the ROCm_UEPT buffer)\n", __func__);
+        return false;
+    }
+
+    const int n_threads = std::max(1, llama_hx_env_int("LLAMA_HX_THREADS", 8));
+    void * engine = start(desc.data(), n_layer, n_threads);
+    if (!engine) {
+        return false;
+    }
+    // r10 V-Cache prefetch: give the engine every layer's router (ffn_gate_inp, f32 [n_embd, n_expert]) so it can
+    // predict layer l+1's experts from layer l's MoE input and stream them into the cache while the GPU works
+    if (llama_hx_env_int("LLAMA_HX_PREFETCH", 0) > 0) {
+        using set_router_fn = void (*)(void *, int, const float *, int64_t, int64_t);
+        auto set_router = (set_router_fn) ggml_backend_reg_get_proc_address(cpu_reg, "ggml_backend_cpu_hx_set_router");
+        int n_router = 0;
+        std::vector<float> buf;
+        for (int il = 1; set_router && il < n_layer; ++il) {
+            const ggml_tensor * r = model.layers[il].ffn_gate_inp;
+            if (!desc[il].mbox || !r || r->type != GGML_TYPE_F32 || r->ne[0] > GGML_HX_MAX_EMBD) {
+                continue;
+            }
+            buf.resize((size_t) ggml_nelements(r));
+            ggml_backend_tensor_get(r, buf.data(), 0, ggml_nbytes(r));
+            set_router(engine, il, buf.data(), r->ne[0], r->ne[1]);
+            ++n_router;
+        }
+        LLAMA_LOG_INFO("%s: HX prefetch predictor: %d layer routers loaded%s\n", __func__, n_router,
+                       set_router ? "" : " (CPU backend without set_router)");
+    }
+    st->engine       = engine;
+    st->engine_stop  = stop;
+    st->engine_stats = stats;
+    st->max_tokens   = std::min(GGML_HX_MAX_TOKENS, std::max(1, llama_hx_env_int("LLAMA_HX_MAX_TOKENS", 4)));
+    st->n_gpu        = std::min(GGML_HX_MAX_USED, std::max(0, llama_hx_env_int("LLAMA_HX_GPU", 0)));
+
+    n_ok = 0;
+    for (int il = 0; il < n_layer; ++il) {
+        n_ok += desc[il].mbox != nullptr;   // the engine clears mbox for layers it cannot run
+    }
+    st->layers.resize(n_layer);
+    for (int il = 0; il < n_layer; ++il) {
+        auto & ops = st->layers[il];
+        ops.ok = desc[il].mbox != nullptr;
+        if (!ops.ok) {
+            continue;
+        }
+        ggml_hx_op base = {};
+        base.magic       = GGML_HX_MAGIC;
+        base.layer       = il;
+        base.mbox_host   = (ggml_hx_mailbox *) host + il;
+        base.mbox_dev    = (ggml_hx_mailbox *) dev + il;
+        base.cpu_engine  = engine;
+        base.cpu_compute = compute;
+        base.n_gpu       = st->n_gpu;
+        ops.post = base; ops.post.kind = GGML_HX_KIND_POST;
+        ops.wait = base; ops.wait.kind = GGML_HX_KIND_WAIT;
+        ops.reorder_ids = base; ops.reorder_ids.kind = GGML_HX_KIND_REORDER_IDS;
+        ops.reorder_w   = base; ops.reorder_w.kind   = GGML_HX_KIND_REORDER_W;
+    }
+    hx = std::move(st);
+    LLAMA_LOG_INFO("%s: HX hybrid expert execution enabled: %d/%d layers, %d CPU threads, ubatch <= %d tokens, "
+        "%d routed experts per token on the GPU\n", __func__, n_ok, n_layer, n_threads, hx->max_tokens, hx->n_gpu);
+    return true;
+}
+
+// Retain caller intent without submitting work from a possibly different server thread.
+void llama_context::expert_cache_set_phase(llama_expert_phase phase) {
+    GGML_ASSERT(phase == LLAMA_EXPERT_PHASE_PREFILL || phase == LLAMA_EXPERT_PHASE_DECODE);
+    expert_phase = phase;
+}
+
+// Queue phase changes outside graph capture; the backend owns the stable device word.
+void llama_context::expert_cache_apply_phase() {
+    if (model.expert_exec() != LLAMA_EXPERT_EXEC_UEPT || model.hparams.no_alloc || model.hparams.vocab_only) {
+        return;
+    }
+    for (auto & backend : backends) {
+        auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend.get()));
+        using phase_fn = void (*)(ggml_backend_t, bool);
+        auto fn = (phase_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_uept_set_phase");
+        if (fn) {
+            fn(backend.get(), expert_phase == LLAMA_EXPERT_PHASE_DECODE);
+        } else if (ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_uept_init")) {
+            GGML_ABORT("UEPT backend is missing the required phase API; rebuild matching host and HIP libraries");
+        }
+    }
+}
+
+// Reset at a request boundary; invariant 6 leaves legacy backends untouched.
+void llama_context::expert_cache_reset() {
+    if (model.expert_exec() != LLAMA_EXPERT_EXEC_UEPT || model.hparams.no_alloc || model.hparams.vocab_only) {
+        return;
+    }
+    for (auto & backend : backends) {
+        auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend.get()));
+        using reset_fn = void (*)(ggml_backend_t);
+        auto fn = (reset_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_uept_reset");
+        if (fn) {
+            fn(backend.get());
+        }
+    }
+}
+
+// Expose explicit cache planning for applications with later GPU allocations.
+bool llama_expert_cache_init(llama_context * ctx, int64_t cache_mib) {
+    return ctx && ctx->expert_cache_init(cache_mib);
+}
+
+// Expose the request-boundary cache reset without modifying sequence state.
+void llama_expert_cache_reset(llama_context * ctx) {
+    if (ctx) {
+        ctx->expert_cache_reset();
+    }
+}
+
+// Set the explicit prefill/decode policy for future evaluations without altering model or KV state.
+void llama_expert_cache_set_phase(llama_context * ctx, llama_expert_phase phase) {
+    if (ctx) {
+        ctx->expert_cache_set_phase(phase);
+    }
+}
+
 llama_context_params llama_context_default_params() {
     llama_context_params result = {
         /*.n_ctx                       =*/ 512,
@@ -3703,6 +4016,7 @@ llama_context_params llama_context_default_params() {
         /*.n_outputs_max_per_seq       =*/ 1,
         /*.n_threads                   =*/ GGML_DEFAULT_N_THREADS, // TODO: better default
         /*.n_threads_batch             =*/ GGML_DEFAULT_N_THREADS,
+        /*.expert_cache_mib            =*/ -1,
         /*.ctx_type                    =*/ LLAMA_CONTEXT_TYPE_DEFAULT,
         /*.rope_scaling_type           =*/ LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED,
         /*.pooling_type                =*/ LLAMA_POOLING_TYPE_UNSPECIFIED,

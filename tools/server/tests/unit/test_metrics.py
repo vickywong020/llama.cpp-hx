@@ -195,6 +195,45 @@ def test_metrics_timings_on_prompt_progress():
     assert prompt_ms > 0
 
 
+@pytest.mark.parametrize("stream", [False, True])
+def test_decode_step_timings_exclude_prefill_and_reset(stream: bool):
+    """Final metadata counts internal steps across split prompts and separate requests."""
+    global server
+    server.n_slots = 1
+    server.start()
+    for count in [9, 3]:
+        payload = {"prompt": "the quick brown fox jumps over the lazy dog " * 8,
+                   "n_predict": count, "ignore_eos": True, "cache_prompt": False,
+                   "decode_step_timings": True, "stream": stream}
+        if stream:
+            chunks = list(server.make_stream_request("POST", "/completion", data=payload))
+            assert all("decode_step_timings" not in chunk for chunk in chunks if not chunk.get("stop"))
+            body = next(chunk for chunk in chunks if chunk.get("stop"))
+        else:
+            res = server.make_request("POST", "/completion", data=payload)
+            assert res.status_code == 200
+            body = res.body
+        trace = body["decode_step_timings"]
+        assert trace["schema"] == 1 and trace["unit"] == "microseconds"
+        assert trace["complete"] is True
+        assert trace["count"] == trace["expected_count"] == count - 1
+        assert len(trace["durations_us"]) == count - 1
+        assert all(type(value) is int and value > 0 for value in trace["durations_us"])
+    res = server.make_request("POST", "/completion", data={"prompt": "I believe", "n_predict": 3})
+    assert "decode_step_timings" not in res.body
+
+
+@pytest.mark.parametrize("count", [1, 8194])
+def test_decode_step_timings_reject_unbounded_or_unsupported_requests(count: int):
+    """Invalid timing requests fail before reserving a trace or evaluating a prompt."""
+    global server
+    server.n_slots = 1
+    server.start()
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "I believe", "n_predict": count, "decode_step_timings": True})
+    assert res.status_code == 400
+
+
 def test_metrics_slots_idle_after_completion():
     global server
     server.server_slots = True

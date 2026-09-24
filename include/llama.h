@@ -311,6 +311,16 @@ extern "C" {
         ggml_backend_buffer_type_t buft;
     };
 
+    enum llama_expert_exec {
+        LLAMA_EXPERT_EXEC_LEGACY = 0,
+        LLAMA_EXPERT_EXEC_UEPT   = 1,
+    };
+
+    enum llama_expert_phase {
+        LLAMA_EXPERT_PHASE_PREFILL = 0,
+        LLAMA_EXPERT_PHASE_DECODE  = 1,
+    };
+
     struct llama_model_params {
         // NULL-terminated list of devices to use for offloading (if NULL, all available devices are used)
         ggml_backend_dev_t * devices;
@@ -323,6 +333,11 @@ extern "C" {
         enum llama_load_mode  load_mode;  // how to load the model
 
         enum llama_lazy_mode lazy_mode; // on-demand reading of tensors marked by the arch
+
+        // Select before model loading. UEPT requires one HIP device and mapped host expert buffers.
+        // Matching tensor placement overrides and unsupported expert formats fail model loading.
+        // Immutable after loading; the default LEGACY path does not create expert caches.
+        enum llama_expert_exec expert_exec;
 
         // the GPU that is used for the entire model when split_mode is LLAMA_SPLIT_MODE_NONE
         int32_t main_gpu;
@@ -367,6 +382,10 @@ extern "C" {
         uint32_t n_outputs_max_per_seq; // max outputs per sequence (0 = n_outputs_max)
         int32_t  n_threads;             // number of threads to use for generation
         int32_t  n_threads_batch;       // number of threads to use for batch processing
+
+        // UEPT cache limit in MiB: -1 = available VRAM minus 1 GiB, 0 = mapped-host reads only.
+        // Applied after KV and compute buffers are reserved; ignored for LEGACY models.
+        int64_t expert_cache_mib;
 
         enum llama_context_type      ctx_type;          // set the context type (e.g. MTP)
         enum llama_rope_scaling_type rope_scaling_type; // RoPE scaling type, from `enum llama_rope_scaling_type`
@@ -558,6 +577,28 @@ extern "C" {
     LLAMA_API size_t llama_max_devices(void);
     LLAMA_API size_t llama_max_parallel_sequences(void);
     LLAMA_API size_t llama_max_tensor_buft_overrides(void);
+
+    // Rebuild the UEPT expert cache after other GPU allocations (for example a vision projector).
+    // cache_mib follows llama_context_params.expert_cache_mib. Returns false on invalid input or failure.
+    // Synchronizes pending work and clears cached experts. Does not change KV state or model weights.
+    // Call only between evaluations, with exclusive access to ctx. A LEGACY context is a successful no-op.
+    LLAMA_API bool llama_expert_cache_init(struct llama_context * ctx, int64_t cache_mib);
+
+    // Reset UEPT cached experts to mapped-host addresses without changing KV state or model weights.
+    // Call between requests with exclusive access to ctx; never concurrently with decode/encode/reset.
+    // Queues the reset on the backend stream; use llama_synchronize() to wait for completion if needed.
+    // LEGACY contexts are a no-op. Shared parallel slots must not reset per request.
+    LLAMA_API void llama_expert_cache_reset(struct llama_context * ctx);
+
+    // Select the UEPT cache policy for subsequent llama_decode() calls, including every microbatch.
+    // PREFILL reads cached experts but never allocates, fills, evicts, or changes the directory.
+    // DECODE permits cache filling. The default is DECODE for compatibility with existing callers.
+    // Set PREFILL for prompt tokens even when the batch contains only one token; use PREFILL for
+    // a mixed prompt/generation batch. Phase is not inferred from token count or logits flags.
+    // Requires exclusive access to ctx between evaluations. The setter only records host intent;
+    // decode applies changes on the backend stream before graph capture, without synchronizing.
+    // Reset/reinit preserve the selected phase. LEGACY contexts are a no-op.
+    LLAMA_API void llama_expert_cache_set_phase(struct llama_context * ctx, enum llama_expert_phase phase);
 
     LLAMA_API bool llama_supports_mmap       (void);
     LLAMA_API bool llama_supports_mlock      (void);

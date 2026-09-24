@@ -356,6 +356,15 @@ json server_task_result_cmpl_final::to_json_non_oaicompat() {
         {"tokens_cached",       n_tokens_cached},
         {"timings",             stats.to_json()},
     };
+    if (generation_params.decode_step_timings) {
+        res["decode_step_timings"] = {
+            {"schema", 1}, {"unit", "microseconds"},
+            {"scope", "decode dispatch through synchronized post-sampling; excludes first prefill-derived output"},
+            {"count", decode_step_us.size()}, {"expected_count", std::max(n_decoded - 1, 0)},
+            {"complete", decode_step_us.size() == size_t(std::max(n_decoded - 1, 0))},
+            {"durations_us", decode_step_us},
+        };
+    }
     if (!stream && !probs_output.empty()) {
         res["completion_probabilities"] = completion_token_output::probs_vector_to_json(probs_output, post_sampling_probs);
     }

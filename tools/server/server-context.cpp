@@ -355,6 +355,10 @@ struct server_slot {
 
     server_slot_stats stats;
 
+    // Kept outside stats to avoid copying an expanding trace to each streaming response.
+    std::vector<int64_t> decode_step_us;
+    int64_t t_decode_step_start = 0;
+
     // accepted tokens per draft position
     // not in server_slot_stats to avoid copying to every task result
     std::vector<uint64_t> n_accepted_per_pos;
@@ -393,6 +397,8 @@ struct server_slot {
 
         // note: callback_on_reset() must have run before this, see release()
         stats = {};
+        decode_step_us.clear();
+        t_decode_step_start = 0;
         n_accepted_per_pos.clear();
 
         n_predict_max = -1;
@@ -1096,7 +1102,13 @@ private:
             params_base.load_progress_callback_user_data = &load_progress_text;
         }
 
+        const int64_t expert_cache_mib = params_base.expert_cache_mib;
+        if (params_base.expert_exec == LLAMA_EXPERT_EXEC_UEPT) {
+            // Reserve the expert pool after the projector and draft contexts have allocated VRAM.
+            params_base.expert_cache_mib = 0;
+        }
         llama_init = common_init_from_params(params_base);
+        params_base.expert_cache_mib = expert_cache_mib;
 
         model_tgt = llama_init->model();
         ctx_tgt   = llama_init->context();
@@ -1180,6 +1192,12 @@ private:
                 params_base.n_cache_reuse = 0;
                 SRV_WRN("%s\n", "cache_reuse is not supported by multimodal, it will be disabled");
             }
+        }
+
+        if (params_base.expert_exec == LLAMA_EXPERT_EXEC_UEPT &&
+                !llama_expert_cache_init(ctx_tgt, expert_cache_mib)) {
+            SRV_ERR("%s", "failed to plan UEPT cache after auxiliary GPU allocations\n");
+            return false;
         }
 
         if (!llama_memory_can_shift(llama_get_memory(ctx_tgt))) {
@@ -1705,6 +1723,20 @@ private:
     }
 
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
+        if (task.params.decode_step_timings) {
+            if (params_base.n_parallel != 1 || spec || task.params.n_cmpl != 1 ||
+                    task.type != SERVER_TASK_TYPE_COMPLETION || task.params.res_type != TASK_RESPONSE_TYPE_NONE ||
+                    task.params.n_predict < 2 || task.params.n_predict > 8193) {
+                send_error(task, "decode_step_timings requires native completion, parallel=1, no speculation, n_cmpl=1, and explicit n_predict in [2,8193]", ERROR_TYPE_INVALID_REQUEST);
+                return false;
+            }
+            slot.decode_step_us.clear();
+            slot.decode_step_us.reserve(task.params.n_predict - 1);
+            slot.t_decode_step_start = 0;
+        }
+        if (params_base.n_parallel == 1) {
+            llama_expert_cache_reset(ctx_tgt);
+        }
         // process per-request lora adapters
         if (!task.params.lora.empty()) {
             auto task_loras = construct_lora_list(task.params.lora);
@@ -2108,6 +2140,7 @@ private:
             res->tokens      = std::move(slot.generated_tokens);
         }
         res->stats           = slot.stats;
+        res->decode_step_us  = std::move(slot.decode_step_us);
         res->prompt          = slot.task->tokens.detokenize(ctx_tgt, true);
         res->response_fields = std::move(slot.task->params.response_fields);
 
@@ -3671,14 +3704,29 @@ private:
         }
 
         bool has_output = false;
+        bool has_prompt = false;
         for (int i = off; i < off + batch_view.n_tokens; ++i) {
             has_output |= batch.tokens[i].output;
+            has_prompt |= batch.tokens[i].is_prompt;
+        }
+
+        // Invariant 5: mixed batches are conservatively read-only, including one-token prompt tails.
+        llama_expert_cache_set_phase(ctx_tgt, has_prompt ? LLAMA_EXPERT_PHASE_PREFILL : LLAMA_EXPERT_PHASE_DECODE);
+        server_slot * timing_slot = nullptr;
+        if (!has_prompt && batch_view.n_tokens == 1) {
+            auto & slot = slots[batch.tokens[off].id_slot];
+            if (slot.task && slot.task->params.decode_step_timings) {
+                timing_slot = &slot;
+            }
         }
 
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
         queue_tasks.yield_to_queue([&]() {
+            if (timing_slot) {
+                timing_slot->t_decode_step_start = ggml_time_us();
+            }
             ret = llama_decode(ctx_tgt, batch_view);
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
@@ -3862,6 +3910,16 @@ private:
 
             // here we have synchronized the llama_context (due to the sampling above), so we can do time measurement
             const int64_t t_now = ggml_time_us();
+
+            if (slot.task->params.decode_step_timings && slot.stats.n_gen > 0) {
+                // Sampling already synchronized; no timing-specific GPU barrier or per-step logging.
+                if (slot.t_decode_step_start <= 0 || t_now <= slot.t_decode_step_start ||
+                        slot.decode_step_us.size() >= size_t(slot.task->params.n_predict - 1)) {
+                    throw std::runtime_error("decode step timing is incomplete or exceeded its reserved bound");
+                }
+                slot.decode_step_us.push_back(t_now - slot.t_decode_step_start);
+                slot.t_decode_step_start = 0;
+            }
 
             slot.stats.n_gen += 1;
 
