@@ -3732,9 +3732,19 @@ bool llama_context::expert_cache_init(int64_t cache_mib) {
     bool initialized = false;
     for (auto & backend : backends) {
         auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend.get()));
-        using init_fn = bool (*)(ggml_backend_t, const ggml_tensor * const *, size_t, int64_t);
-        auto fn = (init_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_uept_init");
-        if (fn) {
+        using init_fn    = bool (*)(ggml_backend_t, const ggml_tensor * const *, size_t, int64_t);
+        using init_ex_fn = bool (*)(ggml_backend_t, const ggml_tensor * const *, size_t, int64_t, int32_t);
+        auto fn    = (init_fn)    ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_uept_init");
+        auto fn_ex = (init_ex_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_uept_init_ex");
+        // an MTP draft context holds one NextN layer: prefill it with direct MMQ so it takes no staging VRAM
+        // away from the target context (flag 1 = GGML_CUDA_UEPT_INIT_DIRECT)
+        const int32_t flags = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP ? 1 : 0;
+        if (fn_ex) {
+            if (!fn_ex(backend.get(), tensors.data(), tensors.size(), cache_mib, flags)) {
+                return false;
+            }
+            initialized = true;
+        } else if (fn) {
             if (!fn(backend.get(), tensors.data(), tensors.size(), cache_mib)) {
                 return false;
             }

@@ -17,6 +17,10 @@ bool ggml_cuda_uept_is_buft(ggml_backend_buffer_type_t buft);
 bool ggml_cuda_uept_is_tensor(const ggml_tensor * tensor);
 bool ggml_cuda_uept_supports_type(ggml_type type);
 ggml_backend_buffer_type_t ggml_backend_cuda_uept_buffer_type(int device);
+#define GGML_CUDA_UEPT_INIT_DIRECT 1   // flags for ggml_backend_cuda_uept_init_ex: prefill with direct MMQ in this context
+
+bool ggml_backend_cuda_uept_init_ex(ggml_backend_t backend, const ggml_tensor * const * tensors,
+        size_t n_tensors, int64_t cache_mib, int32_t flags);
 bool ggml_backend_cuda_uept_init(ggml_backend_t backend, const ggml_tensor * const * tensors,
                                size_t n_tensors, int64_t cache_mib);
 void ggml_backend_cuda_uept_reset(ggml_backend_t backend);

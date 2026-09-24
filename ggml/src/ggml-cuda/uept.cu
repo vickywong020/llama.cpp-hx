@@ -594,6 +594,11 @@ void ggml_cuda_uept_free(ggml_backend_cuda_context & ctx) {
 // Build per-context directories after KV, compute buffers and optional mmproj are allocated.
 bool ggml_backend_cuda_uept_init(ggml_backend_t backend, const ggml_tensor * const * tensors,
         size_t n_tensors, int64_t cache_mib) {
+    return ggml_backend_cuda_uept_init_ex(backend, tensors, n_tensors, cache_mib, 0);
+}
+
+bool ggml_backend_cuda_uept_init_ex(ggml_backend_t backend, const ggml_tensor * const * tensors,
+        size_t n_tensors, int64_t cache_mib, int32_t flags) {
     auto & ctx = *static_cast<ggml_backend_cuda_context *>(backend->context);
     GGML_ASSERT(cache_mib >= -1);
     ggml_cuda_set_device(ctx.device);
@@ -626,6 +631,11 @@ bool ggml_backend_cuda_uept_init(ggml_backend_t backend, const ggml_tensor * con
         } else if (strcmp(mode, "gather") != 0) {
             GGML_ABORT("UEPT: GGML_CUDA_UEPT_MMQ must be 'direct' or 'gather', received '%s'", mode);
         }
+    }
+    // GGML_CUDA_UEPT_INIT_DIRECT: this context prefills with direct MMQ (no staging buffer), e.g. an MTP draft
+    // context with a single NextN layer whose staging would take VRAM from the target context
+    if (flags & GGML_CUDA_UEPT_INIT_DIRECT) {
+        state->prefill_gather = false;
     }
     std::map<int, std::array<const ggml_tensor *, 3>> layer_tensors;
     size_t uept_bytes = 0;
@@ -696,6 +706,13 @@ bool ggml_backend_cuda_uept_init(ggml_backend_t backend, const ggml_tensor * con
     CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
     const size_t free_before_staging = free_bytes;
     const size_t reserve = size_t(1) << 30;
+    if (state->prefill_gather &&
+            free_bytes < state->gather_bytes + state->gather_table_bytes + metadata_bytes + reserve) {
+        // not enough VRAM for the staging buffer: prefill reads the experts in place (direct MMQ) instead of aborting
+        GGML_LOG_WARN("UEPT: gather needs %zu staging bytes plus a 1 GiB reserve but only %zu device bytes are free; "
+                      "this context falls back to direct MMQ prefill\n", state->gather_bytes, free_bytes);
+        state->prefill_gather = false;
+    }
     if (state->prefill_gather) {
         const size_t required = state->gather_bytes + state->gather_table_bytes + metadata_bytes + reserve;
         if (free_bytes < required) {
