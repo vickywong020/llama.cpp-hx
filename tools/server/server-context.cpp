@@ -26,6 +26,8 @@
 #include <random>
 #include <utility>
 #include <fstream>
+#include <map>
+#include <cstdlib>
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -37,6 +39,52 @@
 #endif
 
 constexpr int HTTP_POLLING_SECONDS = 1;
+
+// Opt-in diagnostic mode. Only used with one slot; barriers attribute GPU work
+// to its stage instead of charging it to the next asynchronous decode.
+static bool mtp_profile_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("LLAMA_MTP_PROFILE");
+        return value && std::string(value) == "1";
+    }();
+    return enabled;
+}
+
+static bool mtp_shadow_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("LLAMA_MTP_SHADOW");
+        return value && std::string(value) == "1";
+    }();
+    return enabled;
+}
+
+static llama_tokens mtp_teacher_tokens(int n_prompt) {
+    static const json traces = [] {
+        const char * path = std::getenv("LLAMA_MTP_TEACHER_FILE");
+        if (!path || !*path) { return json::object(); }
+        GGML_ASSERT(mtp_shadow_enabled());
+        std::ifstream input(path);
+        GGML_ASSERT(input.good());
+        const std::string content((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+        return json::parse(content);
+    }();
+    const auto key = std::to_string(n_prompt);
+    return traces.contains(key) ? traces.at(key).get<llama_tokens>() : llama_tokens{};
+}
+
+struct mtp_stage_profile {
+    struct entry { int64_t us = 0; int64_t calls = 0; int64_t tokens = 0; };
+    std::map<std::string, entry> rows;
+
+    int64_t now() const { return mtp_profile_enabled() ? ggml_time_us() : 0; }
+    void add(const char * name, int64_t start, int64_t tokens = 0) {
+        if (!start) { return; }
+        auto & row = rows[name];
+        row.us += ggml_time_us() - start;
+        row.calls++;
+        row.tokens += tokens;
+    }
+};
 
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (params.embedding ||
@@ -354,6 +402,9 @@ struct server_slot {
     std::vector<float> inp_embd;
 
     server_slot_stats stats;
+    mtp_stage_profile mtp_profile;
+    llama_token mtp_shadow_token = LLAMA_TOKEN_NULL;
+    llama_tokens mtp_teacher;
 
     // Kept outside stats to avoid copying an expanding trace to each streaming response.
     std::vector<int64_t> decode_step_us;
@@ -397,6 +448,9 @@ struct server_slot {
 
         // note: callback_on_reset() must have run before this, see release()
         stats = {};
+        mtp_profile.rows.clear();
+        mtp_shadow_token = LLAMA_TOKEN_NULL;
+        mtp_teacher.clear();
         decode_step_us.clear();
         t_decode_step_start = 0;
         n_accepted_per_pos.clear();
@@ -686,6 +740,15 @@ struct server_slot {
                     "     acc per pos = (%s)\n", acceptance_rates_per_pos.c_str());
         }
 
+        if (mtp_profile_enabled()) {
+            json stages = json::object();
+            for (const auto & item : mtp_profile.rows) {
+                stages[item.first] = {{"us", item.second.us}, {"calls", item.second.calls}, {"tokens", item.second.tokens}};
+            }
+            const json report = {{"prompt_tokens", stats.n_prompt_processed}, {"generated", stats.n_gen},
+                {"prompt_ms", t_prompt_total}, {"generation_ms", t_gen_total}, {"stages", stages}};
+            SLT_INF(*this, "MTP_PROFILE %s\n", report.dump().c_str());
+        }
         common_speculative_print_stats(spec);
     }
 
@@ -3013,6 +3076,7 @@ private:
         std::vector<server_slot *> generating;
         std::vector<server_slot *> drafting;
 
+        const int64_t t_prepare_profile = mtp_profile_enabled() && slots.size() == 1 ? ggml_time_us() : 0;
         // determine which slots are generating and drafting
         iterate(slots, [&](server_slot & slot) {
             if (slot.state != SLOT_STATE_GENERATING) {
@@ -3073,17 +3137,31 @@ private:
             }
         });
 
+        if (generating.size() == 1) {
+            generating.front()->mtp_profile.add("prepare", t_prepare_profile);
+        }
+
         // generate the actual drafts (if any)
         if (!drafting.empty()) {
             queue_tasks.yield_to_queue([&]() {
+                const int64_t start = slots.size() == 1 ? drafting.front()->mtp_profile.now() : 0;
                 common_speculative_draft(spec.get());
+                if (start && ctx_dft) { llama_synchronize(ctx_dft); }
+                drafting.front()->mtp_profile.add("draft", start);
             });
         }
 
         // make checkpoints if needed
         iterate(drafting, [&](server_slot & slot) {
+            const int64_t t_checkpoint_profile = slot.mtp_profile.now();
             auto & draft = slot.spec_draft;
             auto & ckpt  = slot.spec_ckpt;
+
+            if (mtp_shadow_enabled()) {
+                GGML_ASSERT(draft.size() <= 1 && "MTP shadow mode requires draft-n-max=1");
+                slot.mtp_shadow_token = draft.empty() ? LLAMA_TOKEN_NULL : draft.front();
+                draft.clear();
+            }
 
             slot.stats.n_draft_tokens += draft.size();
 
@@ -3126,6 +3204,7 @@ private:
                     ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                 }
             }
+            slot.mtp_profile.add("checkpoint_and_draft_rewind", t_checkpoint_profile);
         });
 
         // update the batch with the sampled/drafted tokens
@@ -3727,9 +3806,14 @@ private:
             if (timing_slot) {
                 timing_slot->t_decode_step_start = ggml_time_us();
             }
+            const int64_t start = mtp_profile_enabled() && slots.size() == 1 ? ggml_time_us() : 0;
             ret = llama_decode(ctx_tgt, batch_view);
-            if (ret == 0 && has_output) {
+            if (ret == 0 && (has_output || start)) {
                 llama_synchronize(ctx_tgt);
+            }
+            if (start) {
+                slots.front().mtp_profile.add(has_prompt ? "target_prefill" :
+                    batch_view.n_tokens == 1 ? "target_1" : "target_multi", start, batch_view.n_tokens);
             }
         });
 
@@ -3792,7 +3876,12 @@ private:
         if (spec) {
             bool ok = true;
             queue_tasks.yield_to_queue([&]() {
+                const int64_t start = mtp_profile_enabled() && slots.size() == 1 ? ggml_time_us() : 0;
                 ok = common_speculative_process(spec.get(), batch_view);
+                if (start && ctx_dft) { llama_synchronize(ctx_dft); }
+                if (start) {
+                    slots.front().mtp_profile.add(has_prompt ? "catchup_prefill" : "catchup", start, batch_view.n_tokens);
+                }
             });
 
             if (!ok) {
@@ -3898,6 +3987,7 @@ private:
             // shifted according to the current sub-batch
             const int tok_idx = slot.i_batch - off;
 
+            const int64_t t_sample_profile = slot.mtp_profile.now();
             llama_token id;
             {
                 scoped_timer timer(t_sampl, n_sampl);
@@ -3906,7 +3996,24 @@ private:
 
             slot.i_batch = -1;
 
+            if (mtp_shadow_enabled()) {
+                if (slot.stats.n_gen == 0) { slot.mtp_teacher = mtp_teacher_tokens(slot.prompt.n_tokens()); }
+                if (!slot.mtp_teacher.empty()) {
+                    GGML_ASSERT(size_t(slot.stats.n_gen) < slot.mtp_teacher.size());
+                    id = slot.mtp_teacher.at(slot.stats.n_gen);
+                    GGML_ASSERT(id >= 0 && id < llama_vocab_n_tokens(vocab));
+                }
+            }
+            if (slot.mtp_shadow_token != LLAMA_TOKEN_NULL) {
+                const json row = {{"slot", slot.id}, {"step", slot.stats.n_gen},
+                    {"draft", slot.mtp_shadow_token}, {"target", id},
+                    {"match", slot.mtp_shadow_token == id}};
+                SRV_INF("MTP_SHADOW %s\n", row.dump().c_str());
+                slot.mtp_shadow_token = LLAMA_TOKEN_NULL;
+            }
+
             common_sampler_accept(slot.smpl.get(), id, true);
+            slot.mtp_profile.add(slot.stats.n_gen > 0 ? "sample_single" : "sample_prompt", t_sample_profile);
 
             // here we have synchronized the llama_context (due to the sampling above), so we can do time measurement
             const int64_t t_now = ggml_time_us();
@@ -3964,6 +4071,7 @@ private:
 
             GGML_ASSERT(n_draft > 0);
 
+            const int64_t t_accept_profile = slot.mtp_profile.now();
             // verify and try to accept the draft
             {
                 common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
@@ -4010,6 +4118,7 @@ private:
 
                         slot.prompt.tokens.keep_first(ckpt.n_tokens);
                         common_sampler_copy(smpl_save.get(), slot.smpl.get());
+                        slot.mtp_profile.add("full_replay_restore", t_accept_profile);
 
                         return;
                     }
@@ -4024,6 +4133,7 @@ private:
                 slot.spec_draft = std::move(accepted);
             }
 
+            slot.mtp_profile.add("sample_verify_accept", t_accept_profile);
             const auto ids = std::move(slot.spec_draft);
 
             size_t n_accepted = ids.size() - 1;
@@ -4053,7 +4163,13 @@ private:
             slot.sampled = ids.back(); // last accepted token
             SLT_DBG(slot, "add accepted tokens: sampled=%d, ids.size=%zu, n_draft=%zu\n", slot.sampled, ids.size(), n_draft);
 
+            const int64_t t_rollback_profile = slot.mtp_profile.now();
             slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1);
+            if (t_rollback_profile) {
+                llama_synchronize(ctx_tgt);
+                if (ctx_dft) { llama_synchronize(ctx_dft); }
+            }
+            slot.mtp_profile.add("rollback", t_rollback_profile);
 
             for (size_t i = 0; i < ids.size(); ++i) {
                 completion_token_output result;

@@ -2439,7 +2439,8 @@ struct llama_model_qwen4exp : public llama_model_base {
                     ggml_tensor * inp_pos,
                     ggml_tensor * kq_mask,
                             int * sections,
-                            int   il);
+                            int   il,
+                           bool   store_only = false);
 
         ggml_tensor * build_layer_attn_linear(
              llm_graph_input_rs * inp,

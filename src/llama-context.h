@@ -409,5 +409,5 @@ private:
     mutable int32_t n_reused = 0; // number of times the previous graph was reused
 
     // hybrid CPU/GPU MoE (r9 HX), env LLAMA_HX=1 with --expert-exec uept
-    std::unique_ptr<llama_hx_state> hx;
+    std::shared_ptr<llama_hx_state> hx;
 };

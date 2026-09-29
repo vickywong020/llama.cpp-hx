@@ -1854,7 +1854,18 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     const int cc        = ggml_cuda_info().devices[ctx.device].cc;
     const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
 
-    if (ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, ne11)) {
+    static const bool verify_mmvf = getenv("LLAMA_VERIFY_MMVF") != nullptr;
+    const bool small_verify = verify_mmvf && GGML_CUDA_CC_IS_RDNA4(cc) && ne11 >= 4 && ne11 <= 8 &&
+        ne01 <= 16384 && ne2 == 1 && ne3 == 1 && (src0->type == GGML_TYPE_BF16 || src0->type == GGML_TYPE_F32) &&
+        ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, 1);
+    if (small_verify) {
+        static const bool logged = [] {
+            GGML_LOG_INFO("VERIFY_MMVF: RDNA4 small-batch BF16/F32 vector path active\n");
+            return true;
+        }();
+        GGML_UNUSED(logged);
+    }
+    if (small_verify || ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, ne11)) {
         // The custom F16 vector kernel can be used over batched cuBLAS GEMM.
         // But this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention)
         ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, dst);
@@ -4222,7 +4233,99 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     return 0;
 }
 
+
+static bool verify_gpu_profile_enabled() {
+    static const bool enabled = getenv("LLAMA_VERIFY_GPU_PROFILE") != nullptr;
+    return enabled;
+}
+
+static int verify_graph_tokens(const ggml_cgraph * graph) {
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        const auto * node = graph->nodes[i];
+        if (ggml_cuda_hx_is_op(node)) return (int) node->ne[1];
+    }
+    return 0;
+}
+
+struct verify_gpu_timing {
+    struct mark { cudaEvent_t event; int kind; const ggml_tensor * node; };
+    std::vector<mark> marks;
+    std::vector<cudaEvent_t> pool;
+    bool active;
+    bool state_only;
+    int tokens;
+    cudaStream_t stream;
+    verify_gpu_timing(ggml_backend_cuda_context * ctx, ggml_cgraph * graph)
+        : tokens(verify_gpu_profile_enabled() ? verify_graph_tokens(graph) : 0), stream(ctx->stream()) {
+        active = verify_gpu_profile_enabled() && tokens > 0 && tokens <= 8;
+        const char * mode = getenv("LLAMA_VERIFY_GPU_PROFILE");
+        state_only = mode && strcmp(mode, "state") == 0;
+        if (active) {
+            int capacity = graph->n_nodes + 1;
+            if (state_only) {
+                capacity = 2;
+                for (int i = 0; i < graph->n_nodes; ++i) {
+                    const auto op = graph->nodes[i]->op;
+                    if (op == GGML_OP_GATED_DELTA_NET || op == GGML_OP_CPY ||
+                            op == GGML_OP_GET_ROWS || op == GGML_OP_FLASH_ATTN_EXT) capacity += 2;
+                }
+            }
+            pool.resize(capacity);
+            for (auto & ev : pool) CUDA_CHECK(cudaEventCreateWithFlags(&ev, 0));
+        }
+    }
+    void node(const ggml_tensor * t) {
+        if (!active) return;
+        int kind = 0;
+        if (t->op == GGML_OP_GATED_DELTA_NET) kind = 1;
+        else if (ggml_cuda_hx_is_op(t)) kind = 3;
+        else if (t->op == GGML_OP_MUL_MAT || t->op == GGML_OP_MUL_MAT_ID) kind = 4;
+        else if (t->op == GGML_OP_FLASH_ATTN_EXT) kind = 5;
+        else if (t->op == GGML_OP_CPY || t->op == GGML_OP_GET_ROWS) {
+            for (int j = 0; j < GGML_MAX_SRC; ++j) {
+                const auto * s = t->src[j];
+                while (s && s->view_src) s = s->view_src;
+                if (s && (strstr(s->name, "cache_s_") || strstr(s->name, "cache_r_"))) kind = 2;
+            }
+        }
+        if (state_only && kind != 1 && kind != 2 && kind != 5) kind = 0;
+        if (!marks.empty() && marks.back().kind == kind && kind != 4) return;
+        const cudaEvent_t ev = pool[marks.size()];
+        CUDA_CHECK(cudaEventRecord(ev, stream));
+        marks.push_back({ev, kind, t});
+    }
+    ~verify_gpu_timing() {
+        if (marks.empty()) return;
+        const cudaEvent_t last = pool.back();
+        CUDA_CHECK(cudaEventRecord(last, stream));
+        CUDA_CHECK(cudaEventSynchronize(last));
+        float ms[6] = {};
+        std::vector<std::pair<float, const ggml_tensor *>> mm;
+        for (size_t i = 0; i < marks.size(); ++i) {
+            float value = 0;
+#ifdef GGML_USE_HIP
+            CUDA_CHECK(hipEventElapsedTime(&value, marks[i].event, i+1 < marks.size() ? marks[i+1].event : last));
+#else
+            CUDA_CHECK(cudaEventElapsedTime(&value, marks[i].event, i+1 < marks.size() ? marks[i+1].event : last));
+#endif
+            ms[marks[i].kind] += value;
+            if (marks[i].kind == 4) mm.emplace_back(value, marks[i].node);
+        }
+        GGML_LOG_INFO("VERIFY_GPU n=%d other_ms=%.4f gdn_ms=%.4f state_ms=%.4f hx_wait_ms=%.4f matmul_ms=%.4f attn_ms=%.4f events=%zu\n",
+            tokens, ms[0], ms[1], ms[2], ms[3], ms[4], ms[5], marks.size());
+        std::sort(mm.begin(), mm.end(), [](const auto & a, const auto & b) { return a.first > b.first; });
+        for (size_t i = 0; i < std::min<size_t>(6, mm.size()); ++i) {
+            const auto * t = mm[i].second;
+            GGML_LOG_INFO("VERIFY_MATMUL n=%d ms=%.4f name=%s type=%s k=%lld rows=%lld cols=%lld\n",
+                tokens, mm[i].first, t->name, ggml_type_name(t->src[0]->type),
+                (long long) t->src[0]->ne[0], (long long) t->src[0]->ne[1], (long long) t->src[1]->ne[1]);
+        }
+        for (auto & ev : pool) CUDA_CHECK(cudaEventDestroy(ev));
+    }
+};
+
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
+    verify_gpu_timing verify_timing(cuda_ctx, cgraph);
     bool graph_evaluated_or_captured = false;
 
     // flag used to determine whether it is an integrated_gpu
@@ -4362,6 +4465,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+                verify_timing.node(node);
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 if (nodes_to_skip != 0) {
@@ -4481,7 +4585,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
-    if (graph->is_enabled()) {
+    if (graph->is_enabled() && !verify_gpu_profile_enabled()) {
         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
         if (graph_compatible) {
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
@@ -4523,7 +4627,14 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
     }
 
+    static const bool verify_profile = getenv("LLAMA_VERIFY_PROFILE") != nullptr;
+    const int verify_n = verify_profile ? verify_graph_tokens(cgraph) : 0;
+    const int64_t verify_t0 = verify_n ? ggml_time_us() : 0;
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+    if (verify_n > 0 && verify_n <= 8) {
+        GGML_LOG_INFO("VERIFY_BACKEND n=%d graph=%d capture=%d first=%d submit_us=%lld\n",
+            verify_n, use_cuda_graph, cuda_graph_update_required, first_capture, (long long) (ggml_time_us() - verify_t0));
+    }
 
 #ifdef GGML_USE_HIP
     ggml_cuda_uept_record_graph(*cuda_ctx, use_cuda_graph, cuda_graph_update_required, first_capture);

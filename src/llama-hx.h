@@ -5,6 +5,7 @@
 #include "ggml-hx.h"
 
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 struct llama_hx_layer_ops {
@@ -27,6 +28,9 @@ struct llama_hx_state {
     void (*engine_stop)(void *)            = nullptr;
     void (*engine_stats)(void *, uint64_t *) = nullptr;
     void (*mbox_free)(void *)              = nullptr;
+    void (*engine_detach)(void *, int, int) = nullptr;
+    int engine_first = -1;
+    std::shared_ptr<llama_hx_state> parent;
 
     // true when the op for layer il can run through the hybrid path for a ubatch of n_tokens
     bool enabled(int il, int64_t n_tokens, int64_t n_used) const {

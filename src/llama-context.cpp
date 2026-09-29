@@ -1398,6 +1398,11 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    static const bool verify_profile = getenv("LLAMA_VERIFY_PROFILE") != nullptr;
+    const bool vp = verify_profile && ubatch.n_tokens <= 8;
+    const int64_t vp_start = vp ? ggml_time_us() : 0;
+    int64_t vp_build = 0, vp_alloc = 0;
+    bool vp_reuse = false;
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -1422,6 +1427,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         n_reused++;
+        vp_reuse = true;
     } else {
         gf_res_prev_active = nullptr;
         res->reset();
@@ -1431,7 +1437,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         //const auto t_start_us = ggml_time_us();
 
+        const int64_t vp_t = vp ? ggml_time_us() : 0;
         gf = model.build_graph(gparams);
+        if (vp) vp_build = ggml_time_us() - vp_t;
 
         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
 
@@ -1441,15 +1449,18 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
+        const int64_t vp_a = vp ? ggml_time_us() : 0;
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
         }
 
+        if (vp) vp_alloc = ggml_time_us() - vp_a;
         gf_res_prev_active = res;
     }
 
+    const int64_t vp_inputs = vp ? ggml_time_us() : 0;
     // set the input data for the input tensors
     {
         //const auto t_start_us = ggml_time_us();
@@ -1460,7 +1471,15 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    const int64_t vp_compute = vp ? ggml_time_us() : 0;
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    if (vp) {
+        ggml_backend_sched_synchronize(sched.get());
+        const int64_t vp_end = ggml_time_us();
+        LLAMA_LOG_INFO("VERIFY_CONTEXT ctx=%d n=%u reuse=%d build_us=%lld alloc_us=%lld inputs_us=%lld compute_us=%lld total_us=%lld\n",
+            (int) cparams.ctx_type, ubatch.n_tokens, vp_reuse, (long long) vp_build, (long long) vp_alloc,
+            (long long) (vp_compute - vp_inputs), (long long) (vp_end - vp_compute), (long long) (vp_end - vp_start));
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -3776,6 +3795,9 @@ int llama_hx_state::timeouts() const {
 }
 
 llama_hx_state::~llama_hx_state() {
+    if (engine && engine_detach) {
+        engine_detach(engine, engine_first, n_mbox);
+    }
     if (engine && engine_stop) {
         if (engine_stats) {
             uint64_t st[4] = {};
@@ -3804,12 +3826,14 @@ bool llama_context::hx_init() {
     if (llama_hx_env_int("LLAMA_HX", 0) <= 0) {
         return true;
     }
-    // MTP draft context: its model holds only the NextN block (blk.n_layer), whose routed experts run on the
-    // GPU through UEPT (one layer, ~10 experts per draft token). The HX engine and its mailboxes belong to the
-    // target context alone; a second engine here would oversubscribe the CPU expert threads.
-    if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+    const bool is_mtp = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP;
+    if (is_mtp && llama_hx_env_int("LLAMA_HX_MTP", 0) <= 0) {
         LLAMA_LOG_INFO("%s: MTP draft context: HX off, NextN experts run through UEPT on the GPU\n", __func__);
         return true;
+    }
+    if (is_mtp && (!cparams.ctx_other || !cparams.ctx_other->hx)) {
+        LLAMA_LOG_ERROR("%s: LLAMA_HX_MTP requires a target HX context\n", __func__);
+        return false;
     }
     if (model.expert_exec() != LLAMA_EXPERT_EXEC_UEPT || model.arch != LLM_ARCH_QWEN4EXP) {
         LLAMA_LOG_ERROR("%s: LLAMA_HX requires --expert-exec uept and a qwen4exp model\n", __func__);
@@ -3851,8 +3875,9 @@ bool llama_context::hx_init() {
         return false;
     }
 
-    const int n_layer = (int) model.hparams.n_layer();
-    auto st = std::make_unique<llama_hx_state>();
+    const int layer_first = is_mtp ? (int) model.hparams.n_layer() : 0;
+    const int n_layer = is_mtp ? (int) model.hparams.n_layer_all - layer_first : (int) model.hparams.n_layer();
+    auto st = std::make_shared<llama_hx_state>();
     void * host = nullptr;
     void * dev  = nullptr;
     if (!alloc(gpu, sizeof(ggml_hx_mailbox) * (size_t) n_layer, &host, &dev)) {
@@ -3870,7 +3895,7 @@ bool llama_context::hx_init() {
     int n_ok = 0;
     for (int il = 0; il < n_layer; ++il) {
         desc[il] = {};
-        const auto & L = model.layers[il];
+        const auto & L = model.layers[layer_first + il];
         const ggml_tensor * g = L.ffn_gate_exps;
         const ggml_tensor * u = L.ffn_up_exps;
         const ggml_tensor * d = L.ffn_down_exps;
@@ -3905,13 +3930,32 @@ bool llama_context::hx_init() {
     }
 
     const int n_threads = std::max(1, llama_hx_env_int("LLAMA_HX_THREADS", 8));
-    void * engine = start(desc.data(), n_layer, n_threads);
-    if (!engine) {
-        return false;
+    void * engine = nullptr;
+    int engine_first = 0;
+    if (is_mtp) {
+        using attach_fn = int (*)(void *, ggml_hx_layer_desc *, int);
+        auto attach = (attach_fn) ggml_backend_reg_get_proc_address(cpu_reg, "ggml_backend_cpu_hx_attach");
+        auto detach = (void (*)(void *, int, int)) ggml_backend_reg_get_proc_address(cpu_reg, "ggml_backend_cpu_hx_detach");
+        if (!attach || !detach) {
+            LLAMA_LOG_ERROR("%s: CPU backend lacks the shared HX pool API\n", __func__);
+            return false;
+        }
+        cparams.ctx_other->synchronize();
+        st->parent = cparams.ctx_other->hx;
+        engine = st->parent->engine;
+        engine_first = attach(engine, desc.data(), n_layer);
+        if (engine_first < 0) return false;
+        st->engine_detach = detach;
+        st->engine_first = engine_first;
+    } else {
+        engine = start(desc.data(), n_layer, n_threads);
+        if (!engine) return false;
     }
+    st->engine = engine;
+    st->engine_stop = is_mtp ? nullptr : stop;
     // r10 V-Cache prefetch: give the engine every layer's router (ffn_gate_inp, f32 [n_embd, n_expert]) so it can
     // predict layer l+1's experts from layer l's MoE input and stream them into the cache while the GPU works
-    if (llama_hx_env_int("LLAMA_HX_PREFETCH", 0) > 0) {
+    if (!is_mtp && llama_hx_env_int("LLAMA_HX_PREFETCH", 0) > 0) {
         using set_router_fn = void (*)(void *, int, const float *, int64_t, int64_t);
         auto set_router = (set_router_fn) ggml_backend_reg_get_proc_address(cpu_reg, "ggml_backend_cpu_hx_set_router");
         int n_router = 0;
@@ -3930,7 +3974,6 @@ bool llama_context::hx_init() {
                        set_router ? "" : " (CPU backend without set_router)");
     }
     st->engine       = engine;
-    st->engine_stop  = stop;
     st->engine_stats = stats;
     st->max_tokens   = std::min(GGML_HX_MAX_TOKENS, std::max(1, llama_hx_env_int("LLAMA_HX_MAX_TOKENS", 4)));
     st->n_gpu        = std::min(GGML_HX_MAX_USED, std::max(0, llama_hx_env_int("LLAMA_HX_GPU", 0)));
@@ -3939,16 +3982,16 @@ bool llama_context::hx_init() {
     for (int il = 0; il < n_layer; ++il) {
         n_ok += desc[il].mbox != nullptr;   // the engine clears mbox for layers it cannot run
     }
-    st->layers.resize(n_layer);
+    st->layers.resize(layer_first + n_layer);
     for (int il = 0; il < n_layer; ++il) {
-        auto & ops = st->layers[il];
+        auto & ops = st->layers[layer_first + il];
         ops.ok = desc[il].mbox != nullptr;
         if (!ops.ok) {
             continue;
         }
         ggml_hx_op base = {};
         base.magic       = GGML_HX_MAGIC;
-        base.layer       = il;
+        base.layer       = engine_first + il;
         base.mbox_host   = (ggml_hx_mailbox *) host + il;
         base.mbox_dev    = (ggml_hx_mailbox *) dev + il;
         base.cpu_engine  = engine;
@@ -3960,6 +4003,10 @@ bool llama_context::hx_init() {
         ops.reorder_w   = base; ops.reorder_w.kind   = GGML_HX_KIND_REORDER_W;
     }
     hx = std::move(st);
+    if (is_mtp) {
+        LLAMA_LOG_INFO("%s: MTP draft context: shared HX CPU pool, %d NextN layers, ubatch <= %d tokens\n", __func__, n_ok, hx->max_tokens);
+        return true;
+    }
     LLAMA_LOG_INFO("%s: HX hybrid expert execution enabled: %d/%d layers, %d CPU threads, ubatch <= %d tokens, "
         "%d routed experts per token on the GPU\n", __func__, n_ok, n_layer, n_threads, hx->max_tokens, hx->n_gpu);
     return true;

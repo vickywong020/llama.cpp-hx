@@ -1344,10 +1344,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     //   chain_heads (step35): n_mtp_layers trained heads, one per draft step.
     //   neither (qwen35 / qwen35moe): a single trained MTP head.
     int32_t n_mtp_layers  = 1;
+    bool    qwen_position_aligned = false;
     bool    is_mem_shared = false;   // gemma4
     bool    chain_heads   = false;   // derived in the ctor: n_mtp_layers > 1 && !is_mem_shared
 
-    // Per-sequence cross-batch carryover: pair (h_p, x_{p+1}) at MTP pos p+1.
+    // Carry the previous hidden row across batches to pair with the next token.
     // The last h-row of one process() call needs the first token of the NEXT
     // call to pair with, so it's stashed here until that next call fires.
     std::vector<std::vector<float>> pending_h;   // [n_seq][n_embd]
@@ -1362,6 +1363,123 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
+
+    // A renewal-reward controller: maximize useful target positions per us.
+    // Each arm is a draft cap, including zero (skip the draft head this round).
+    // Observe whole rounds so verification, catch-up and rollback are charged.
+    struct cost_arm {
+        double tokens = 0.0;
+        double us = 0.0;
+        double weight = 0.0;
+        uint32_t samples = 0;
+        uint32_t last_used = 0;
+    };
+    std::vector<cost_arm> cost_arms;
+    struct cost_prefix {
+        double hit = 0.0;
+        double seen = 0.0;
+    };
+    std::vector<cost_prefix> cost_prefixes;
+    bool cost_control = false;
+    bool cost_trace = false;
+    int cost_cap = 0;
+    int cost_best = 1;
+    int cost_pending_arm = -1;
+    llama_pos cost_pending_pos = -1;
+    int64_t cost_pending_us = 0;
+    uint32_t cost_rounds = 0;
+
+    double cost_expected_tokens(int cap) const {
+        double prefix = 1.0, total = 1.0;
+        for (int j = 0; j < cap; ++j) {
+            const auto & p = cost_prefixes[j];
+            // Independent Beta(1/2, 1/2) priors for conditional prefix survival.
+            prefix *= (p.hit + 0.5)/(p.seen + 1.0);
+            total += prefix;
+        }
+        return total;
+    }
+
+    double cost_rate(int cap) const {
+        const auto & arm = cost_arms[cap];
+        return cost_expected_tokens(cap)*arm.weight/arm.us;
+    }
+
+    int choose_cost_cap(llama_pos pos, int limit) {
+        const int max_cap = (int) cost_arms.size() - 1;
+        limit = limit > 0 ? std::min(limit, max_cap) : max_cap;
+        const int64_t now = ggml_time_us();
+        if (cost_pending_arm >= 0) {
+            const int advance = pos - cost_pending_pos;
+            const int64_t elapsed = now - cost_pending_us;
+            // Prefix replays are included in elapsed. A discontinuous request
+            // or restored prompt is not a usable throughput observation.
+            if (advance > 0 && advance <= cost_pending_arm + 1 && elapsed > 0) {
+                auto & arm = cost_arms[cost_pending_arm];
+                // Ratio of discounted sums, not a mean of per-round ratios.
+                const double decay = arm.samples < 8 ? 1.0 : 0.875;
+                arm.tokens = decay*arm.tokens + advance;
+                arm.us = decay*arm.us + elapsed;
+                arm.weight = decay*arm.weight + 1.0;
+                ++arm.samples;
+                // All accepted prefixes are successes; only the first rejected
+                // or confidence-filtered position is a failure. Later positions
+                // are right-censored, never counted as failures. Caps share data.
+                const int accepted = advance - 1;
+                for (int j = 0; j < cost_pending_arm && j <= accepted; ++j) {
+                    auto & p = cost_prefixes[j];
+                    const double forget = p.seen < 8.0 ? 1.0 : 0.875;
+                    p.hit = forget*p.hit + (j < accepted ? 1.0 : 0.0);
+                    p.seen = forget*p.seen + 1.0;
+                }
+                if (cost_trace) {
+                    SPC_INF("MTP_COST observe cap=%d advance=%d us=%" PRId64 " rate=%.3f samples=%u\n",
+                            cost_pending_arm, advance, elapsed, 1e6*arm.tokens/arm.us, arm.samples);
+                }
+            }
+        }
+
+        // Two initial observations per cap; thereafter a bounded exploration
+        // round every 32 rounds prevents permanently starving another cap.
+        int selected = -1;
+        for (int pass = 0; pass < 2 && selected < 0; ++pass) {
+            for (int cap = 0; cap <= limit; ++cap) {
+                if (cost_arms[cap].samples <= (uint32_t) pass) {
+                    selected = cap;
+                    break;
+                }
+            }
+        }
+        if (selected < 0) {
+            cost_best = std::min(cost_best, limit);
+            double best_rate = cost_rate(cost_best);
+            for (int cap = 0; cap <= limit; ++cap) {
+                const double rate = cost_rate(cap);
+                // A small hysteresis avoids switches driven by timing noise.
+                if (rate > best_rate*1.02) {
+                    best_rate = rate;
+                    cost_best = cap;
+                }
+            }
+            selected = cost_best;
+            if (cost_rounds % 32 == 0) {
+                for (int cap = 0; cap <= limit; ++cap) {
+                    if (cost_arms[cap].last_used < cost_arms[selected].last_used) {
+                        selected = cap;
+                    }
+                }
+            }
+        }
+        cost_arms[selected].last_used = ++cost_rounds;
+        cost_pending_arm = selected;
+        cost_pending_pos = pos;
+        cost_pending_us = now;
+        if (cost_trace) {
+            SPC_INF("MTP_COST choose cap=%d round=%u best=%d expected=%.4f\n",
+                    selected, cost_rounds, cost_best, cost_expected_tokens(selected));
+        }
+        return selected;
+    }
 
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
@@ -1424,6 +1542,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         llama_model_meta_val_str(llama_get_model(ctx_dft), "general.architecture", arch, sizeof(arch));
         is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt && std::strcmp(arch, "gemma4-assistant") == 0;
         chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
+        const char * legacy_align = std::getenv("LLAMA_MTP_LEGACY_ALIGN");
+        qwen_position_aligned = std::strcmp(arch, "qwen4exp") == 0 &&
+            !(legacy_align && std::string(legacy_align) == "1");
+        if (qwen_position_aligned) {
+            SPC_INF("%s", "Qwen MTP: pair (h[p], token[p+1]) at cache position p; no dummy BOS entry\n");
+        }
 
         if (chain_heads) {
             this->params.n_max = std::min(this->params.n_max, n_mtp_layers);
@@ -1434,6 +1558,21 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
         }
         this->n_max = this->params.n_max;
+
+        cost_cap = this->n_max;
+        if (std::getenv("LLAMA_MTP_COST_CONTROL")) {
+            // Whole-round timing can only be attributed to one active slot.
+            cost_control = n_seq == 1 && qwen_position_aligned && !chain_heads &&
+                !is_mem_shared && this->n_max >= 1 && this->n_max <= 8 && this->params.n_min <= 1;
+            if (cost_control) {
+                cost_arms.resize(this->n_max + 1);
+                cost_prefixes.resize(this->n_max);
+                cost_trace = std::getenv("LLAMA_MTP_COST_TRACE") != nullptr;
+                SPC_INF("MTP_COST enabled caps=0..%d, single-slot prefix survival / whole-round cost\n", this->n_max);
+            } else {
+                SPC_WRN("%s", "MTP_COST disabled: requires single-slot Qwen MTP, n_min<=1 and 1<=n_max<=8\n");
+            }
+        }
 
         pending_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
 
@@ -1466,6 +1605,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
+        // Retain learned hardware/workload rates, but never time between requests.
+        cost_pending_arm = -1;
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
             return;
@@ -1474,7 +1615,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         auto * ctx_dft = this->params.ctx_dft;
         const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id);
 
-        if (pos_max < N - 1 && !is_mem_shared) {
+        if (pos_max < N - 1 - int(qwen_position_aligned) && !is_mem_shared) {
             SPC_WRN("ctx_dft pos_max=%d < N-1=%d - "
                     "process() hook may not have run on every prefill ubatch "
                     "(need_embd / logits=1 on every prompt position?). "
@@ -1521,31 +1662,51 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         if (!is_mem_shared) {
             common_batch_clear(batch);
 
-            for (int k = 0; k < n_tokens; ++k) {
-                common_batch_add(batch, batch_in.token[k], batch_in.pos[k], { batch_in.seq_id[k][0] }, 0);
-            }
-
-            // shift the tgt embeddings to the right by one position
-            // assumes that the tokens in the batch are sequential for each sequence
-            // i.e. we cannot have seq_id like this: [0, 0, 0, 1, 1, 0, 1, 1]
-            //                                                       ^--- this is a problem
-            // TODO:this is generally true, but would be nice to assert it
-            {
+            if (qwen_position_aligned) {
                 const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
-                std::memcpy(batch.embd + (size_t) 1 * n_embd, h_tgt, row_bytes * (n_tokens-1));
-            }
-
-            // fill the pending embeddings from a previous run
-            auto set_h = [&](int idx, const float * h_row) {
-                std::memcpy(batch.embd + (size_t) idx * n_embd, h_row, row_bytes);
-            };
-
-            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-                if (i_batch_beg[seq_id] < 0) {
-                    continue;
+                auto * mem = llama_get_memory(ctx_dft);
+                for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                    const int32_t beg = i_batch_beg[seq_id];
+                    const int32_t end = i_batch_end[seq_id];
+                    if (beg < 0) { continue; }
+                    // Server checkpoints use target token positions. Trim here
+                    // in the draft's shifted coordinates before replacing KV.
+                    const llama_pos first = std::max(0, batch_in.pos[beg] - 1);
+                    GGML_ASSERT(llama_memory_seq_rm(mem, seq_id, first, -1));
+                    for (int32_t k = beg; k <= end; ++k) {
+                        if (batch_in.pos[k] == 0) { continue; }
+                        const float * h = k == beg ? pending_h[seq_id].data() : h_tgt + (size_t) (k - 1)*n_embd;
+                        common_batch_add(batch, batch_in.token[k], batch_in.pos[k] - 1, { seq_id }, false);
+                        std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1)*n_embd, h, row_bytes);
+                    }
+                }
+            } else {
+                for (int k = 0; k < n_tokens; ++k) {
+                    common_batch_add(batch, batch_in.token[k], batch_in.pos[k], { batch_in.seq_id[k][0] }, 0);
                 }
 
-                set_h(i_batch_beg[seq_id], pending_h[seq_id].data());
+                // shift the tgt embeddings to the right by one position
+                // assumes that the tokens in the batch are sequential for each sequence
+                // i.e. we cannot have seq_id like this: [0, 0, 0, 1, 1, 0, 1, 1]
+                //                                                       ^--- this is a problem
+                // TODO:this is generally true, but would be nice to assert it
+                {
+                    const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
+                    std::memcpy(batch.embd + (size_t) 1 * n_embd, h_tgt, row_bytes * (n_tokens-1));
+                }
+
+                // fill the pending embeddings from a previous run
+                auto set_h = [&](int idx, const float * h_row) {
+                    std::memcpy(batch.embd + (size_t) idx * n_embd, h_row, row_bytes);
+                };
+
+                for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                    if (i_batch_beg[seq_id] < 0) {
+                        continue;
+                    }
+
+                    set_h(i_batch_beg[seq_id], pending_h[seq_id].data());
+                }
             }
 
             auto * mem_dft = llama_get_memory(ctx_dft);
@@ -1563,7 +1724,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     llama_set_nextn_layer_offset(ctx_dft, head);
                 }
 
-                const int32_t rc = llama_decode(ctx_dft, batch);
+                const int32_t rc = batch.n_tokens > 0 ? llama_decode(ctx_dft, batch) : 0;
                 if (rc != 0) {
                     SPC_ERR("llama_decode(ctx_dft) head=%d failed rc=%d (pos=%d)\n",
                             head, (int) rc, (int) batch_in.pos[0]);
@@ -1601,6 +1762,28 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         return true;
     }
 
+    bool get_state(llama_seq_id seq_id, std::vector<uint8_t> & data) const override {
+        if (!qwen_position_aligned || seq_id < 0 || seq_id >= (llama_seq_id) n_seq) { return false; }
+        const uint32_t header[2] = {0x4d545031u, (uint32_t) n_embd};
+        data.resize(sizeof(header) + (size_t) n_embd*sizeof(float));
+        std::memcpy(data.data(), header, sizeof(header));
+        std::memcpy(data.data() + sizeof(header), pending_h[seq_id].data(), (size_t) n_embd*sizeof(float));
+        return true;
+    }
+
+    void set_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {
+        if (!qwen_position_aligned || seq_id < 0 || seq_id >= (llama_seq_id) n_seq) { return; }
+        uint32_t header[2];
+        if (data.size() != sizeof(header) + (size_t) n_embd*sizeof(float)) { return; }
+        std::memcpy(header, data.data(), sizeof(header));
+        if (header[0] != 0x4d545031u || header[1] != (uint32_t) n_embd) { return; }
+        std::memcpy(pending_h[seq_id].data(), data.data() + sizeof(header), (size_t) n_embd*sizeof(float));
+        verify_h_rows[seq_id] = 0;
+        verify_h[seq_id].clear();
+    }
+
+    uint32_t cache_tested = 0;
+
     void draft(common_speculative_draft_params_vec & dparams) override {
         auto & ctx_dft = params.ctx_dft;
 
@@ -1619,11 +1802,24 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 continue;
             }
 
+            if (cost_control) {
+                cost_cap = choose_cost_cap(dp.pos0, dp.n_max);
+                if (cost_cap == 0) {
+                    dp.result->clear();
+                    continue;
+                }
+            }
+
             n_drafting++;
             drafting[seq_id] = true;
             common_sampler_reset(smpls[seq_id].get());
 
-            common_batch_add(batch, dp.id_last, dp.pos0, { seq_id }, true);
+            const llama_pos draft_pos = dp.pos0 - int(qwen_position_aligned);
+            if (qwen_position_aligned) {
+                GGML_ASSERT(draft_pos >= 0);
+                GGML_ASSERT(llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, draft_pos, -1));
+            }
+            common_batch_add(batch, dp.id_last, draft_pos, { seq_id }, true);
             std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, pending_h[seq_id].data(), row_bytes);
 
             i_last[seq_id] = batch.n_tokens - 1;
@@ -1652,10 +1848,55 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 llama_set_nextn_layer_offset(ctx_dft, i);
             }
 
+            static const bool check_cache = [] {
+                const char * value = std::getenv("LLAMA_MTP_CACHE_TEST");
+                return value && std::string(value) == "1";
+            }();
+            const uint32_t cache_bit = batch.pos[0] < 2048 ? 1 : batch.pos[0] < 32768 ? 2 : 4;
+            std::vector<uint8_t> cache_before;
+            if (check_cache && i == 0 && !(cache_tested & cache_bit)) {
+                GGML_ASSERT(n_seq == 1 && batch.n_tokens == 1);
+                cache_before.resize(llama_state_seq_get_size(ctx_dft, 0));
+                GGML_ASSERT(llama_state_seq_get_data(ctx_dft, cache_before.data(), cache_before.size(), 0) == cache_before.size());
+            }
+
             int ret = llama_decode(ctx_dft, batch);
             if (ret != 0) {
                 SPC_ERR("llama_decode[%d] returned %d\n", i, ret);
                 break;
+            }
+            if (!cache_before.empty()) {
+                const int sampled_count = llama_get_sampled_logits_count_ith(ctx_dft, 0);
+                const int nv = sampled_count ? sampled_count : llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_dft)));
+                const float * logits = llama_get_logits_ith(ctx_dft, 0);
+                const llama_token * candidates = llama_get_sampled_candidates_ith(ctx_dft, 0);
+                std::map<llama_token, float> expected;
+                for (int k = 0; k < nv; ++k) { expected[candidates ? candidates[k] : k] = logits[k]; }
+                const float * h = llama_get_embeddings_nextn_ith(ctx_dft, 0);
+                const std::vector<float> expected_h(h, h + n_embd);
+                GGML_ASSERT(llama_state_seq_set_data(ctx_dft, cache_before.data(), cache_before.size(), 0) == cache_before.size());
+                std::vector<uint8_t> restored(llama_state_seq_get_size(ctx_dft, 0));
+                GGML_ASSERT(llama_state_seq_get_data(ctx_dft, restored.data(), restored.size(), 0) == restored.size());
+                const bool state_exact = restored == cache_before;
+                GGML_ASSERT(llama_decode(ctx_dft, batch) == 0);
+                logits = llama_get_logits_ith(ctx_dft, 0);
+                candidates = llama_get_sampled_candidates_ith(ctx_dft, 0);
+                h = llama_get_embeddings_nextn_ith(ctx_dft, 0);
+                float logit_diff = 0.0f, hidden_diff = 0.0f;
+                for (int k = 0; k < nv; ++k) {
+                    const llama_token id = candidates ? candidates[k] : k;
+                    GGML_ASSERT(expected.count(id) == 1);
+                    logit_diff = std::max(logit_diff, std::fabs(logits[k] - expected.at(id)));
+                }
+                for (int k = 0; k < n_embd; ++k) { hidden_diff = std::max(hidden_diff, std::fabs(h[k] - expected_h[k])); }
+                const int top_before = std::max_element(expected.begin(), expected.end(),
+                        [](const auto & x, const auto & y) { return x.second < y.second; })->first;
+                const int top_index = std::max_element(logits, logits + nv) - logits;
+                const int top_after = candidates ? candidates[top_index] : top_index;
+                cache_tested |= cache_bit;
+                SPC_INF("MTP_CACHE_CHECK pos=%d bytes=%zu state_exact=%d logit_diff=%.9g hidden_diff=%.9g top_before=%d top_after=%d\n",
+                        batch.pos[0], cache_before.size(), int(state_exact), logit_diff, hidden_diff, top_before, top_after);
+                GGML_ASSERT(state_exact && logit_diff < 1e-5f && hidden_diff < 1e-5f && top_before == top_after);
             }
 
             // rebuild the batch for the next step: the growing-KV paths re-add only the
@@ -1684,6 +1925,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 // add drafted token for each sequence
                 const llama_token id = cur_p->data[0].id;
 
+                static const bool trace = [] {
+                    const char * value = std::getenv("LLAMA_MTP_TRACE");
+                    return value && std::string(value) == "1";
+                }();
+                if (trace) {
+                    SPC_INF("MTP_CANDIDATE seq=%d pos=%d token=%d p=%.8f\n",
+                            seq_id, dparams[seq_id].pos0 + i + 1, id, cur_p->data[0].p);
+                }
+
                 // only collect very high-confidence draft tokens
                 if (cur_p->data[0].p < params.p_min) {
                     drafting[seq_id] = false;
@@ -1699,7 +1949,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 result.push_back(id);
 
-                if (params.n_max <= (int) result.size()) {
+                if ((cost_control ? cost_cap : params.n_max) <= (int) result.size()) {
                     drafting[seq_id] = false;
                     n_drafting--;
                     continue;
@@ -1722,7 +1972,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     common_batch_add(batch, id, dp.pos0, { seq_id }, true);
                     std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, h_row, row_bytes);
                 } else {
-                    common_batch_add(batch, id, dp.pos0 + i + 1, { seq_id }, true);
+                    common_batch_add(batch, id, dp.pos0 + i + 1 - int(qwen_position_aligned), { seq_id }, true);
                     std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, h_row, row_bytes);
                 }
 
@@ -2545,7 +2795,28 @@ common_speculative_init_result::common_speculative_init_result(
     auto cparams = common_context_params_to_llama(params);
 
     if (spec_mtp) {
+        const char * gpu_resident = getenv("LLAMA_MTP_GPU_RESIDENT");
+        if (gpu_resident && atoi(gpu_resident) != 0) {
+            if (!has_draft) {
+                LOG_ERR("%s: LLAMA_MTP_GPU_RESIDENT requires a separate draft model\n", __func__);
+                return;
+            }
+            // Only the separate draft changes placement; the target keeps HX/UEPT.
+            mparams.expert_exec = LLAMA_EXPERT_EXEC_LEGACY;
+            LOG_INF("%s: MTP draft placement: native GPU offload requested\n", __func__);
+        }
         cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+        const char * value = getenv("LLAMA_MTP_UBATCH");
+        if (value && *value) {
+            char * end = nullptr;
+            const long n = strtol(value, &end, 10);
+            if (*end || n < 1 || n > cparams.n_batch) {
+                LOG_ERR("%s: LLAMA_MTP_UBATCH must be between 1 and %u\n", __func__, cparams.n_batch);
+                return;
+            }
+            cparams.n_ubatch = (uint32_t) n;
+            LOG_INF("%s: MTP independent ubatch = %u\n", __func__, cparams.n_ubatch);
+        }
     }
 
     // the draft context holds as many tokens per sequence as the target context

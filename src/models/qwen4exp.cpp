@@ -81,6 +81,26 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
     qwen4exp_require_nonzero(ml, LLM_KV_ATTENTION_INDEXER_TOP_K,      hparams.indexer_top_k);
     ml.get_key_or_arr(LLM_KV_ATTENTION_COMPRESS_RATIOS, hparams.dsv4_compress_ratios, hparams.n_layer_all, false);
 
+    for (uint32_t il = hparams.n_layer(); il < hparams.n_layer_all; ++il) {
+        if (hparams.dsv4_compress_ratios[il] != 0 ||
+                ml.get_weight(format("blk.%u.indexer.q_proj.weight", il).c_str()) == nullptr) {
+            continue;
+        }
+        uint32_t ratio = 0;
+        for (uint32_t j = 0; j < hparams.n_layer(); ++j) {
+            const uint32_t r = hparams.dsv4_compress_ratios[j];
+            if (r && ratio && r != ratio) {
+                throw std::runtime_error("QWEN4EXP MTP: ambiguous missing indexer ratio; reconvert the draft GGUF");
+            }
+            if (r) { ratio = r; }
+        }
+        if (!ratio) {
+            throw std::runtime_error("QWEN4EXP MTP: missing indexer compression ratio; reconvert the draft GGUF");
+        }
+        hparams.dsv4_compress_ratios[il] = ratio;
+        LLAMA_LOG_INFO("%s: MTP layer %u indexer ratio = %u (legacy GGUF metadata)\n", __func__, il, ratio);
+    }
+
     // PLE n-gram hash embeddings; if the key group is absent every field stays zero
     hparams.is_ple_impl.reset();
     hparams.ple_n_heads = 0;
@@ -520,12 +540,18 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     ggml_build_forward_expand(gf, cur);
 }
 
-// TODO: QSA for the draft head; dense is a numerical superset below the 2048-token budget.
+// The draft block uses the same QSA selection as a full-attention trunk block.
 llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_graph_params & params) :
     graph(model, params, no_build_t{}) {
     GGML_ASSERT(hparams.n_layer_nextn > 0 && "QWEN4EXP MTP requires n_layer_nextn > 0");
     GGML_ASSERT(hparams.n_layer_nextn == 1 && "QWEN4EXP MTP currently only supports a single MTP block");
     GGML_ASSERT(ubatch.token && "QWEN4EXP MTP requires token input");
+
+    static const bool kv_only_enabled = [] {
+        const char * value = std::getenv("LLAMA_MTP_KV_ONLY");
+        return value && std::string(value) == "1";
+    }();
+    const bool kv_only = kv_only_enabled && n_outputs == 0 && cparams.embeddings_nextn_masked;
 
     const int64_t hc     = hparams.dsv4_hc_mult;
     const int64_t hc_dim = hc * n_embd;
@@ -571,11 +597,22 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     res->add_input(std::move(inp));
 
     ggml_tensor * inp_pos     = build_inp_pos();
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    ggml_tensor * inp_out_ids = kv_only ? nullptr : build_inp_out_ids();
 
-    auto * inp_attn = build_attn_inp_kv();
+    const char * dense_env = std::getenv("LLAMA_MTP_DENSE_ATTN");
+    const bool qsa = hparams.dsv4_compress_ratios[il] > 0 &&
+        !(dense_env && std::string(dense_env) == "1");
+    auto * inp_hyb = qsa ? build_inp_mem_hybrid() : nullptr;
+    auto * inp_attn = qsa ? inp_hyb->get_attn() : build_attn_inp_kv();
 
-    ggml_tensor * h_norm = ggml_rms_norm(ctx0, h_state, hparams.f_norm_rms_eps);
+    // pre_fc_norm_hidden normalizes the entire HC residual, before the
+    // per-stream shared projection. Per-branch RMS changes the draft model.
+    static const bool legacy_hnorm = [] {
+        const char * value = std::getenv("LLAMA_MTP_LEGACY_HNORM");
+        return value && std::string(value) == "1";
+    }();
+    ggml_tensor * h_norm = legacy_hnorm ? h_state : ggml_reshape_2d(ctx0, h_state, hc_dim, n_tokens);
+    h_norm = ggml_rms_norm(ctx0, h_norm, hparams.f_norm_rms_eps);
     h_norm = ggml_reshape_2d(ctx0, h_norm, hc_dim, n_tokens);
     h_norm = ggml_mul(ctx0, h_norm, layer.nextn.hnorm);
     h_norm = ggml_reshape_3d(ctx0, h_norm, n_embd, hc, n_tokens);
@@ -599,6 +636,15 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
             layer.hc_attn_norm, layer.hc_attn_down, layer.hc_attn_up, layer.hc_attn_inject,
             &inject, il);
     cb(cur, "mtp_hc_attn_pre", il);
+
+    // Always cache raw index keys, including zero-output catch-up batches.
+    // Below the selection budget every visible key is retained, so selection
+    // and sparse-mask construction can be skipped without changing attention.
+    const auto * mctx_hyb = qsa ? static_cast<const llama_memory_hybrid_idx_context *>(mctx) : nullptr;
+    const bool select_qsa = qsa && !kv_only &&
+        mctx_hyb->get_idx()->get_n_kv() > hparams.indexer_top_k;
+    ggml_tensor * top_k = qsa ? build_qsa_top_k(mctx_hyb, cur, inp_pos,
+        inp_attn->get_kq_mask(), sections, il, !select_qsa) : nullptr;
 
     const int64_t n_embd_head = hparams.n_embd_head_v();
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
@@ -640,9 +686,13 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     const float kq_scale = hparams.f_attention_scale == 0.0f
             ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
 
-    cur = build_attn(inp_attn,
-            nullptr, nullptr, nullptr,
-            Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+    cur = top_k ? build_attn_qsa(inp_attn, Qcur, Kcur, Vcur, top_k, kq_scale, il) :
+        build_attn(inp_attn, nullptr, nullptr, nullptr,
+            Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il, kv_only);
+    // A single NextN block only needs its K/V stores during cache catch-up.
+    if (kv_only) {
+        return;
+    }
     cb(cur, "mtp_attn_pregate", il);
 
     cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, gate));
@@ -739,7 +789,9 @@ public:
 
     void set_input(const llama_ubatch * ubatch) override {
         mctx->get_idx()->set_input_k_idxs(k_idxs, ubatch);
-        mctx->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias);
+        if (cell_blk->buffer) {
+            mctx->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias);
+        }
     }
 
     bool can_reuse(const llm_graph_params & params) override {
@@ -789,7 +841,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         ggml_tensor *                           inp_pos,
         ggml_tensor *                           kq_mask,
         int *                                   sections,
-        int                                     il) {
+        int                                     il,
+        bool                                    store_only) {
     const llama_kv_cache_context * mctx_idx = mctx_hyb->get_idx();
 
     const int64_t idx_dim  = hparams.indexer_head_size;
@@ -845,6 +898,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     cb(k_raw, "indexer_k_raw", il);
 
     ggml_build_forward_expand(gf, mctx_idx->cpy_k(ctx0, k_raw, inp->k_idxs, il));
+    if (store_only) { return nullptr; }
 
     // one key head, so rows are contiguous. get_k gives [idx_dim, n_head_kv, n_kv, n_stream].
     ggml_tensor * k_all = mctx_idx->get_k(ctx0, il);
@@ -1428,7 +1482,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
     ggml_tensor * state = ggml_reshape_3d(ctx0, rows, state_cols, channels, n_seqs);
     cb(state, "conv_state_at", il);
 
-    ggml_tensor * conv_input = ggml_concat(ctx0, state, ggml_transpose(ctx0, x), 0);
+    ggml_tensor * transposed = ggml_transpose(ctx0, x);
+    static const bool conv_cont = getenv("LLAMA_QWEN_CONV_CONT") != nullptr;
+    if (conv_cont && ubatch.n_seq_tokens > 1) {
+        transposed = ggml_cont(ctx0, transposed);
+    }
+    ggml_tensor * conv_input = ggml_concat(ctx0, state, transposed, 0);
 
     // [TAG_RECURRENT_ROLLBACK_SPLITS] keep the last state_cols columns once per rollback slot,
     // slot s ending s tokens earlier so a rollback of s tokens reads a history that never saw them
@@ -1450,7 +1509,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
                 conv_states_all->nb[1],
                 (slot * mem_size + kv_head) * row_size);
 
-        ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_cont(ctx0, tail), dst));
+        static const bool direct_state_copy = getenv("LLAMA_QWEN_STATE_COPY_DIRECT") != nullptr;
+        ggml_tensor * saved = direct_state_copy ? tail : ggml_cont(ctx0, tail);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, saved, dst));
     }
 
     return conv_input;

@@ -29,7 +29,8 @@ llama_memory_hybrid::llama_memory_hybrid(
                      bool   unified,
                             /* layer filters */
     const layer_filter_cb & filter_attn,
-    const layer_filter_cb & filter_recr) :
+    const layer_filter_cb & filter_recr,
+                     bool   recurrent) :
     hparams(model.hparams),
     mem_attn(new llama_kv_cache(
         model,
@@ -51,7 +52,7 @@ llama_memory_hybrid::llama_memory_hybrid(
         nullptr,
         nullptr
     )),
-    mem_recr(new llama_memory_recurrent(
+    mem_recr(recurrent ? new llama_memory_recurrent(
         model,
         type_r,
         type_s,
@@ -62,7 +63,7 @@ llama_memory_hybrid::llama_memory_hybrid(
         filter_recr == nullptr ?
             [&](int32_t il) { return hparams.is_recr(il); }
             : filter_recr
-    )) {}
+    ) : nullptr) {}
 
 llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
     do {
@@ -84,7 +85,7 @@ llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & ba
                 // [TAG_RECURRENT_ROLLBACK_SPLITS]
                 // the trailing (1 + n_rs_seq) tokens of each seq must stay in the same ubatch
                 //   so that the rollback snapshots remain valid
-                const uint32_t n_rs_seq = mem_recr->n_rs_seq;
+                const uint32_t n_rs_seq = mem_recr ? mem_recr->n_rs_seq : 0;
 
                 ubatch = balloc.split_equal(n_ubatch, !unified, n_rs_seq > 0 ? n_rs_seq + 1 : 0);
             }
@@ -102,7 +103,7 @@ llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & ba
         }
 
         // prepare the recurrent batches first
-        if (!mem_recr->prepare(ubatches)) {
+        if (mem_recr && !mem_recr->prepare(ubatches)) {
             // TODO: will the recurrent cache be in an undefined context at this point?
             LLAMA_LOG_ERROR("%s: failed to prepare recurrent ubatches\n", __func__);
             return std::make_unique<llama_memory_hybrid_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
@@ -137,13 +138,13 @@ bool llama_memory_hybrid::get_can_shift() const {
 
 void llama_memory_hybrid::clear(bool data) {
     mem_attn->clear(data);
-    mem_recr->clear(data);
+    if (mem_recr) { mem_recr->clear(data); }
 }
 
 bool llama_memory_hybrid::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     // Try removing from the recurrent cache first since it may fail. If it does
     // fail, the cache will not have been mutated.
-    if (!mem_recr->seq_rm(seq_id, p0, p1)) {
+    if (mem_recr && !mem_recr->seq_rm(seq_id, p0, p1)) {
         return false;
     }
     return mem_attn->seq_rm(seq_id, p0, p1);
@@ -151,38 +152,42 @@ bool llama_memory_hybrid::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
 
 void llama_memory_hybrid::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
     mem_attn->seq_cp(seq_id_src, seq_id_dst, p0, p1);
-    mem_recr->seq_cp(seq_id_src, seq_id_dst, p0, p1);
+    if (mem_recr) { mem_recr->seq_cp(seq_id_src, seq_id_dst, p0, p1); }
 }
 
 void llama_memory_hybrid::seq_keep(llama_seq_id seq_id) {
     mem_attn->seq_keep(seq_id);
-    mem_recr->seq_keep(seq_id);
+    if (mem_recr) { mem_recr->seq_keep(seq_id); }
 }
 
 void llama_memory_hybrid::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
     mem_attn->seq_add(seq_id, p0, p1, shift);
-    mem_recr->seq_add(seq_id, p0, p1, shift);
+    if (mem_recr) { mem_recr->seq_add(seq_id, p0, p1, shift); }
 }
 
 void llama_memory_hybrid::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
     mem_attn->seq_div(seq_id, p0, p1, d);
-    mem_recr->seq_div(seq_id, p0, p1, d);
+    if (mem_recr) { mem_recr->seq_div(seq_id, p0, p1, d); }
 }
 
 llama_pos llama_memory_hybrid::seq_pos_min(llama_seq_id seq_id) const {
     // the min of the total cache is the max of the two caches' min values
-    return std::max(mem_attn->seq_pos_min(seq_id), mem_recr->seq_pos_min(seq_id));
+    return mem_recr ? std::max(mem_attn->seq_pos_min(seq_id), mem_recr->seq_pos_min(seq_id))
+                    : mem_attn->seq_pos_min(seq_id);
 }
 
 llama_pos llama_memory_hybrid::seq_pos_max(llama_seq_id seq_id) const {
     // the max of the total cache is the min of the two caches' max values
-    return std::min(mem_attn->seq_pos_max(seq_id), mem_recr->seq_pos_max(seq_id));
+    return mem_recr ? std::min(mem_attn->seq_pos_max(seq_id), mem_recr->seq_pos_max(seq_id))
+                    : mem_attn->seq_pos_max(seq_id);
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> mb = mem_attn->memory_breakdown();
-    for (const auto & buft_size : mem_recr->memory_breakdown()) {
-        mb[buft_size.first] += buft_size.second;
+    if (mem_recr) {
+        for (const auto & buft_size : mem_recr->memory_breakdown()) {
+            mb[buft_size.first] += buft_size.second;
+        }
     }
     return mb;
 }
@@ -191,14 +196,14 @@ void llama_memory_hybrid::state_write(llama_io_write_i & io, llama_seq_id seq_id
     if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
         mem_attn->state_write(io, seq_id, flags);
     }
-    mem_recr->state_write(io, seq_id, flags);
+    if (mem_recr) { mem_recr->state_write(io, seq_id, flags); }
 }
 
 void llama_memory_hybrid::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
     if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
         mem_attn->state_read(io, seq_id, flags);
     }
-    mem_recr->state_read(io, seq_id, flags);
+    if (mem_recr) { mem_recr->state_read(io, seq_id, flags); }
 }
 
 llama_kv_cache * llama_memory_hybrid::get_mem_attn() const {
@@ -213,8 +218,8 @@ llama_memory_hybrid_context::llama_memory_hybrid_context(llama_memory_status sta
 
 llama_memory_hybrid_context::llama_memory_hybrid_context(llama_memory_hybrid * mem) :
     ctx_attn(mem->get_mem_attn()->init_full()),
-    ctx_recr(mem->get_mem_recr()->init_full()),
-    status(llama_memory_status_combine(ctx_attn->get_status(), ctx_recr->get_status())) {
+    ctx_recr(mem->get_mem_recr() ? mem->get_mem_recr()->init_full() : nullptr),
+    status(ctx_recr ? llama_memory_status_combine(ctx_attn->get_status(), ctx_recr->get_status()) : ctx_attn->get_status()) {
 }
 
 llama_memory_hybrid_context::llama_memory_hybrid_context(
@@ -222,8 +227,8 @@ llama_memory_hybrid_context::llama_memory_hybrid_context(
               llama_context * lctx,
                        bool   optimize) :
     ctx_attn(mem->get_mem_attn()->init_update(lctx, optimize)),
-    ctx_recr(mem->get_mem_recr()->init_update(lctx, optimize)),
-    status(llama_memory_status_combine(ctx_attn->get_status(), ctx_recr->get_status())) {
+    ctx_recr(mem->get_mem_recr() ? mem->get_mem_recr()->init_update(lctx, optimize) : nullptr),
+    status(ctx_recr ? llama_memory_status_combine(ctx_attn->get_status(), ctx_recr->get_status()) : ctx_attn->get_status()) {
 }
 
 llama_memory_hybrid_context::llama_memory_hybrid_context(
@@ -233,15 +238,15 @@ llama_memory_hybrid_context::llama_memory_hybrid_context(
     ubatches(std::move(ubatches)),
     // note: here we copy the ubatches. not sure if this is ideal
     ctx_attn(new llama_kv_cache_context(mem->get_mem_attn(), std::move(sinfos_attn), this->ubatches)),
-    ctx_recr(new llama_memory_recurrent_context(mem->get_mem_recr(), this->ubatches)),
-    status(llama_memory_status_combine(ctx_attn->get_status(), ctx_recr->get_status())) {
+    ctx_recr(mem->get_mem_recr() ? new llama_memory_recurrent_context(mem->get_mem_recr(), this->ubatches) : nullptr),
+    status(ctx_recr ? llama_memory_status_combine(ctx_attn->get_status(), ctx_recr->get_status()) : ctx_attn->get_status()) {
 }
 
 bool llama_memory_hybrid_context::next() {
     assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
 
     ctx_attn->next();
-    ctx_recr->next();
+    if (ctx_recr) { ctx_recr->next(); }
 
     if (++i_next >= ubatches.size()) {
         return false;
@@ -256,7 +261,7 @@ bool llama_memory_hybrid_context::apply() {
     bool res = true;
 
     res = res & ctx_attn->apply();
-    res = res & ctx_recr->apply();
+    if (ctx_recr) { res = res & ctx_recr->apply(); }
 
     return res;
 }

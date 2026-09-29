@@ -70,9 +70,29 @@ struct hx_job {
     uint64_t seq;
 };
 
+struct alignas(64) hx_worker_sample {
+    int64_t start_us = 0, end_us = 0;
+    int groups = 0;
+};
+
 struct hx_engine {
     std::vector<hx_layer> layers;
     int n_threads = 8;
+    bool profile = getenv("LLAMA_VERIFY_PROFILE") != nullptr;
+    bool read_probe = getenv("LLAMA_HX_READ_PROBE") != nullptr;
+    bool expert_parallel = getenv("LLAMA_HX_EXPERT_PARALLEL") != nullptr;
+    int schedule = [] {
+        const char * value = getenv("LLAMA_HX_SCHEDULE");
+        return value && std::strcmp(value, "dynamic") == 0 ? 1 :
+               value && std::strcmp(value, "memory") == 0 ? 2 : 0;
+    }();
+    bool balance_profile = getenv("LLAMA_HX_BALANCE_PROFILE") != nullptr;
+    std::vector<hx_worker_sample> worker_samples;
+    int64_t balance_span_us = 0, balance_busy_us = 0, balance_wait_us = 0;
+    int balance_jobs = 0, balance_min_groups = 0, balance_max_groups = 0;
+    double profile_a_us = 0, profile_b_us = 0, profile_read_us = 0;
+    uint64_t profile_jobs = 0, profile_unique = 0, profile_pairs = 0, profile_bytes = 0;
+    int n_primary_layers = 0;
     int64_t max_ff = 0;
     int64_t max_embd = 0;
 
@@ -82,11 +102,13 @@ struct hx_engine {
     // job broadcast
     std::atomic<uint64_t> gen{0};
     hx_job job{};
+    alignas(64) std::atomic<int> next_expert{0};
     std::atomic<int> bar_count{0};
     std::atomic<uint64_t> bar_gen{0};
 
     // shared intermediates: h[pair][n_ff]
     std::vector<float> h;
+    std::vector<float> expert_output;
 
     // stats
     std::atomic<uint64_t> n_tasks{0};
@@ -237,6 +259,8 @@ struct hx_scratch {
     std::vector<uint8_t> xq_gate, xq_up, hq;
     std::vector<float> g, u, v, acc;
     hx_groups groups;
+    std::vector<int> work;
+    int processed_groups = 0;
 };
 
 // y[t][r] for r in [r0, r1): sum_k w[t,k] * down_{e}(h_{t,k})[r]
@@ -336,6 +360,88 @@ static void hx_compute_stage_b(const hx_layer & L, const int32_t * ids, int64_t 
     }
 }
 
+static void hx_compute_expert_groups(const hx_layer & L, const ggml_hx_mailbox * mb,
+        float * output, int ith, int nth, hx_scratch & s, int schedule, std::atomic<int> & next_expert) {
+    const int nt = mb->n_tokens, nk = mb->n_used;
+    const int64_t ne = L.d.n_embd, nf = L.d.n_ff;
+    hx_groups & G = s.groups;
+    G.build(mb->ids, nk, nt, nk, L.d.n_expert);
+
+    int order[GGML_HX_MAX_TOKENS * GGML_HX_MAX_USED];
+    int owner[GGML_HX_MAX_TOKENS * GGML_HX_MAX_USED];
+    for (int i = 0; i < G.n; ++i) order[i] = i;
+    std::sort(order, order + G.n, [&](int a, int b) {
+        return G.count[a] != G.count[b] ? G.count[a] > G.count[b] : a < b;
+    });
+    if (schedule != 1) {
+        s.work.assign(nth, 0);
+        for (int i = 0; i < G.n; ++i) {
+            const int u = order[i];
+            const int worker = std::min_element(s.work.begin(), s.work.end()) - s.work.begin();
+            owner[u] = worker;
+            s.work[worker] += schedule == 2 ? 1 : 2 + G.count[u];
+        }
+    }
+
+    s.xq_gate.resize(nt * L.row_gate);
+    s.xq_up.resize(nt * L.row_up);
+    for (int t = 0; t < nt; ++t) {
+        L.q_gate(mb->x + t * ne, s.xq_gate.data() + t * L.row_gate, ne);
+        if (L.vt_up != L.vt_gate) L.q_up(mb->x + t * ne, s.xq_up.data() + t * L.row_up, ne);
+    }
+    const uint8_t * xu = L.vt_up != L.vt_gate ? s.xq_up.data() : s.xq_gate.data();
+    s.g.resize(nt * nf);
+    s.u.resize(nt * nf);
+    s.hq.resize(nt * L.row_down);
+    s.processed_groups = 0;
+    for (int i = 0;; ++i) {
+        const int index = schedule == 1 ? next_expert.fetch_add(1, std::memory_order_relaxed) : i;
+        if (index >= G.n) break;
+        const int u = schedule ? order[index] : index;
+        if (schedule != 1 && owner[u] != ith) continue;
+        ++s.processed_groups;
+        const int e = G.expert[u], m = G.count[u];
+        const void * ag[GGML_HX_MAX_TOKENS], * au[GGML_HX_MAX_TOKENS], * ad[GGML_HX_MAX_TOKENS];
+        float * og[GGML_HX_MAX_TOKENS], * ou[GGML_HX_MAX_TOKENS], * od[GGML_HX_MAX_TOKENS];
+        for (int j = 0; j < m; ++j) {
+            const int p = G.members[u][j], t = p / nk;
+            ag[j] = s.xq_gate.data() + t * L.row_gate;
+            au[j] = xu + t * L.row_up;
+            og[j] = s.g.data() + j * nf;
+            ou[j] = s.u.data() + j * nf;
+            ad[j] = s.hq.data() + j * L.row_down;
+            od[j] = output + p * ne;
+        }
+        hx_dot_rows_multi(L.tg, (ggml_type) L.d.type_gate, L.vt_gate, ne, og,
+            (const char *) L.d.gate + e * L.d.gate_nb2, L.d.gate_nb1, nf, ag, m);
+        hx_dot_rows_multi(L.tu, (ggml_type) L.d.type_up, L.vt_up, ne, ou,
+            (const char *) L.d.up + e * L.d.up_nb2, L.d.up_nb1, nf, au, m);
+        for (int j = 0; j < m; ++j) {
+            ggml_vec_swiglu_f32(nf, og[j], og[j], ou[j]);
+            L.q_down(og[j], s.hq.data() + j * L.row_down, nf);
+        }
+        hx_dot_rows_multi(L.td, (ggml_type) L.d.type_down, L.vt_down, nf, od,
+            (const char *) L.d.down + e * L.d.down_nb2, L.d.down_nb1, ne, ad, m);
+    }
+}
+
+static void hx_reduce_expert_groups(const hx_layer & L, ggml_hx_mailbox * mb,
+        const float * output, int ith, int nth) {
+    const int64_t ne = L.d.n_embd;
+    const int64_t r0 = ne * ith / nth, r1 = ne * (ith + 1) / nth;
+    for (int t = 0; t < mb->n_tokens; ++t) {
+        float * y = mb->y + t * ne;
+        std::fill(y + r0, y + r1, 0.0f);
+        // Keep the original expert reduction order for each token.
+        for (int k = 0; k < mb->n_used; ++k) {
+            const int p = t * mb->n_used + k;
+            const float w = mb->w[p];
+            const float * v = output + p * ne;
+            for (int64_t r = r0; r < r1; ++r) y[r] += v[r] * w;
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // r10 V-Cache prefetch
 
@@ -352,7 +458,7 @@ static void hx_pf_init(hx_engine & E) {
     }
     const char * e = getenv("LLAMA_HX_PREFETCH");
     E.pf_k = e ? std::max(0, std::min(32, atoi(e))) : 0;
-    const int nl = (int) E.layers.size();
+    const int nl = E.n_primary_layers;
     int ne = 0;
     for (const auto & L : E.layers) ne = std::max(ne, (int) L.d.n_expert);
     E.n_expert = ne;
@@ -367,7 +473,7 @@ static void hx_pf_init(hx_engine & E) {
 
 // leader, at the start of a task for layer li (token 0 of the task): hit statistics, co-occurrence update, remember ids
 static void hx_pf_observe(hx_engine & E, int li, const ggml_hx_mailbox * mb) {
-    if (!E.pf_k) return;
+    if (!E.pf_k || li >= E.n_primary_layers) return;
     const int n_used = std::min<int>(mb->n_used, GGML_HX_MAX_USED);
     const int ne = E.n_expert;
     if (E.pred_n[li] > 0) {
@@ -419,8 +525,8 @@ static void hx_router_scores(const hx_engine & E, int lj, const float * x, int n
 
 // leader, after finishing layer li: remember its ids, predict layer li+1 and publish the prefetch
 static void hx_pf_predict(hx_engine & E, int li, const ggml_hx_mailbox * mb) {
-    if (!E.pf_k) return;
-    const int nl = (int) E.layers.size();
+    if (!E.pf_k || li >= E.n_primary_layers) return;
+    const int nl = E.n_primary_layers;
     const int n_used = std::min<int>(mb->n_used, GGML_HX_MAX_USED);
     const int lj = li + 1;
     // previous token's ids at li+1 are still in last_ids[lj] (this token has not reached it yet)
@@ -429,7 +535,27 @@ static void hx_pf_predict(hx_engine & E, int li, const ggml_hx_mailbox * mb) {
     std::fill(score, score + ne, 0.0f);
     const bool use_router = E.pred_mode == 1 && lj < nl && (size_t) lj < E.rq.size() && !E.rq[lj].empty() && E.layers[lj].d.mbox;
     if (use_router) {
-        hx_router_scores(E, lj, mb->x, (int) E.layers[li].d.n_embd, score);
+        static const bool batch_prefetch = getenv("LLAMA_HX_PREFETCH_BATCH") != nullptr;
+        if (batch_prefetch && mb->n_tokens > 1 && E.pf_skip == 0) {
+            float token_score[1024];
+            int order[1024];
+            const int n_embd = (int) E.layers[li].d.n_embd;
+            const int nt = std::min<int>(mb->n_tokens, GGML_HX_MAX_TOKENS);
+            const int nk = std::min(n_used, ne);
+            for (int t = 0; t < nt; ++t) {
+                hx_router_scores(E, lj, mb->x + (size_t) t * n_embd, n_embd, token_score);
+                for (int e = 0; e < ne; ++e) order[e] = e;
+                std::partial_sort(order, order + nk, order + ne, [&](int a, int b) {
+                    return token_score[a] > token_score[b] || (token_score[a] == token_score[b] && a < b);
+                });
+                // Frequency first, then rank. Shared experts run first in expert-parallel mode.
+                for (int rank = 0; rank < nk; ++rank) {
+                    score[order[rank]] += 1.0f + float(nk - rank) / float(nk * nt);
+                }
+            }
+        } else {
+            hx_router_scores(E, lj, mb->x, (int) E.layers[li].d.n_embd, score);
+        }
         E.pred_router.fetch_add(1, std::memory_order_relaxed);
     } else if (lj < nl && E.layers[lj].d.mbox) {
         const uint16_t * C = E.cooc.data() + (size_t) li * E.n_expert * E.n_expert;
@@ -538,10 +664,74 @@ static void hx_run_job(hx_engine & E, int ith, hx_scratch & s) {
     ggml_hx_mailbox * mb = L.d.mbox;
     const int n_tokens = mb->n_tokens;
     const int n_used   = mb->n_used;
-    hx_compute_stage_a(L, mb->x, L.d.n_embd, mb->ids, n_used, n_tokens, n_used, E.h.data(), ith, E.n_threads, s);
+    const int64_t t0 = E.profile && ith == 0 ? ggml_time_us() : 0;
+    if (E.read_probe) {
+        s.groups.build(mb->ids, n_used, n_tokens, n_used, L.d.n_expert);
+        uint64_t sink = 0;
+        const int64_t a0 = L.d.n_ff * ith / E.n_threads, a1 = L.d.n_ff * (ith + 1) / E.n_threads;
+        const int64_t b0 = L.d.n_embd * ith / E.n_threads, b1 = L.d.n_embd * (ith + 1) / E.n_threads;
+        for (int i = 0; i < s.groups.n; ++i) {
+            const int e = s.groups.expert[i];
+            const char * ptrs[] = { (const char *) L.d.gate + e * L.d.gate_nb2 + a0 * L.d.gate_nb1,
+                (const char *) L.d.up + e * L.d.up_nb2 + a0 * L.d.up_nb1,
+                (const char *) L.d.down + e * L.d.down_nb2 + b0 * L.d.down_nb1 };
+            const size_t lens[] = { (size_t) (a1-a0)*L.d.gate_nb1, (size_t) (a1-a0)*L.d.up_nb1, (size_t) (b1-b0)*L.d.down_nb1 };
+            for (int j = 0; j < 3; ++j) for (size_t k = 0; k < lens[j]; k += 64) sink += *(const volatile uint64_t *) (ptrs[j] + k);
+        }
+        if (sink == 0x5a5a5a5a5a5a5a5aull) E.sleeps.fetch_add(1, std::memory_order_relaxed);
+        E.barrier();
+    }
+    const int64_t t1 = E.profile && ith == 0 ? ggml_time_us() : 0;
+    const bool by_expert = E.expert_parallel && n_tokens > 1;
+    const int64_t work_start = E.balance_profile && by_expert ? ggml_time_us() : 0;
+    if (by_expert) {
+        if (E.schedule && ith == 0) {
+            thread_local bool logged = false;
+            if (!logged) {
+                GGML_LOG_INFO("HX expert schedule active: %s\n", E.schedule == 1 ? "dynamic" : "memory");
+                logged = true;
+            }
+        }
+        hx_compute_expert_groups(L, mb, E.expert_output.data(), ith, E.n_threads, s, E.schedule, E.next_expert);
+    } else {
+        hx_compute_stage_a(L, mb->x, L.d.n_embd, mb->ids, n_used, n_tokens, n_used, E.h.data(), ith, E.n_threads, s);
+    }
+    if (E.balance_profile && by_expert) {
+        E.worker_samples[ith] = {work_start, ggml_time_us(), s.processed_groups};
+    }
     E.barrier();
-    hx_compute_stage_b(L, mb->ids, n_used, mb->w, n_used, n_tokens, n_used, E.h.data(), mb->y, L.d.n_embd, ith, E.n_threads, s);
+    const int64_t t2 = E.profile && ith == 0 ? ggml_time_us() : 0;
+    if (E.balance_profile && by_expert && ith == 0) {
+        int64_t first = E.worker_samples[0].start_us, last = E.worker_samples[0].end_us;
+        int low = s.groups.n, high = 0;
+        for (const auto & sample : E.worker_samples) {
+            first = std::min(first, sample.start_us);
+            last = std::max(last, sample.end_us);
+            low = std::min(low, sample.groups);
+            high = std::max(high, sample.groups);
+            E.balance_busy_us += sample.end_us - sample.start_us;
+        }
+        for (const auto & sample : E.worker_samples) E.balance_wait_us += last - sample.end_us;
+        E.balance_span_us += last - first;
+        E.balance_min_groups += low;
+        E.balance_max_groups += high;
+        ++E.balance_jobs;
+    }
+    if (by_expert) {
+        hx_reduce_expert_groups(L, mb, E.expert_output.data(), ith, E.n_threads);
+    } else {
+        hx_compute_stage_b(L, mb->ids, n_used, mb->w, n_used, n_tokens, n_used, E.h.data(), mb->y, L.d.n_embd, ith, E.n_threads, s);
+    }
     E.barrier();
+    if (E.profile && ith == 0) {
+        E.profile_read_us += t1 - t0;
+        E.profile_a_us += t2 - t1;
+        E.profile_b_us += ggml_time_us() - t2;
+        E.profile_jobs++;
+        E.profile_unique += s.groups.n;
+        E.profile_pairs += n_tokens * n_used;
+        E.profile_bytes += s.groups.n * (L.d.gate_nb2 + L.d.up_nb2 + L.d.down_nb2);
+    }
 }
 
 static void hx_worker(hx_engine * E, int ith) {
@@ -593,6 +783,8 @@ static void hx_leader(hx_engine * E) {
                 const auto t0 = clk::now();
                 hx_pf_observe(*E, li, L.d.mbox);
                 E->job = { li, seq };
+                // Publish the empty queue with the new job generation.
+                if (E->schedule == 1) E->next_expert.store(0, std::memory_order_relaxed);
                 E->gen.fetch_add(1, std::memory_order_acq_rel);
                 hx_run_job(*E, 0, s);
                 L.done = seq;
@@ -600,10 +792,26 @@ static void hx_leader(hx_engine * E) {
                 const auto t1 = clk::now();
                 E->n_tasks.fetch_add(1, std::memory_order_relaxed);
                 E->busy_ns.fetch_add((uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count(), std::memory_order_relaxed);
+                if (E->balance_profile && li == E->n_primary_layers - 1) {
+                    GGML_LOG_INFO("HX_BALANCE n=%d jobs=%d threads=%d span_us=%lld busy_us=%lld wait_us=%lld min_groups=%d max_groups=%d\n",
+                        L.d.mbox->n_tokens, E->balance_jobs, E->n_threads, (long long) E->balance_span_us,
+                        (long long) E->balance_busy_us, (long long) E->balance_wait_us, E->balance_min_groups, E->balance_max_groups);
+                    E->balance_jobs = E->balance_min_groups = E->balance_max_groups = 0;
+                    E->balance_span_us = E->balance_busy_us = E->balance_wait_us = 0;
+                }
+                if (E->profile && li == E->n_primary_layers - 1) {
+                    GGML_LOG_INFO("VERIFY_HX n=%d jobs=%llu unique=%llu pairs=%llu weight_bytes=%llu read_us=%.0f a_us=%.0f b_us=%.0f pf_pred=%llu pf_hits=%llu pf_bytes=%llu\n",
+                        L.d.mbox->n_tokens, (unsigned long long) E->profile_jobs, (unsigned long long) E->profile_unique,
+                        (unsigned long long) E->profile_pairs, (unsigned long long) E->profile_bytes,
+                        E->profile_read_us, E->profile_a_us, E->profile_b_us,
+                        (unsigned long long) E->pf_predicted.load(), (unsigned long long) E->pf_hits.load(), (unsigned long long) E->pf_bytes.load());
+                    E->profile_jobs = E->profile_unique = E->profile_pairs = E->profile_bytes = 0;
+                    E->profile_read_us = E->profile_a_us = E->profile_b_us = 0;
+                }
                 next = (li + 1) % n_layers;
                 last = t1;
                 found = true;
-                if (E->pf_k) {
+                if (E->pf_k && li < E->n_primary_layers) {
                     hx_pf_predict(*E, li, L.d.mbox);
                     hx_pf_run(*E, 0, E->gen.load(std::memory_order_acquire));
                     // servers are usually killed, not stopped: log the predictor statistics periodically
@@ -663,12 +871,33 @@ static bool hx_init_layer(hx_layer & L, const ggml_hx_layer_desc & d) {
     return true;
 }
 
+// Call only with all GPU producers synchronized and no pending mailbox jobs.
+static void hx_pause(hx_engine & E) {
+    E.stop.store(true);
+    for (auto & t : E.threads) t.join();
+    E.threads.clear();
+}
+
+static void hx_resume(hx_engine & E) {
+    E.gen.store(0);
+    E.pf_gen.store(0);
+    E.pf_layer = -1;
+    E.pf_cnt = 0;
+    E.bar_count.store(0);
+    E.bar_gen.store(0);
+    E.stop.store(false);
+    E.threads.emplace_back(hx_leader, &E);
+    for (int i = 1; i < E.n_threads; ++i) E.threads.emplace_back(hx_worker, &E, i);
+}
+
 } // namespace
 
 extern "C" {
 
 GGML_BACKEND_API void * ggml_backend_cpu_hx_start(ggml_hx_layer_desc * layers, int n_layers, int n_threads);
 GGML_BACKEND_API void   ggml_backend_cpu_hx_stop(void * engine);
+GGML_BACKEND_API int    ggml_backend_cpu_hx_attach(void * engine, ggml_hx_layer_desc * layers, int n_layers);
+GGML_BACKEND_API void   ggml_backend_cpu_hx_detach(void * engine, int first, int n_layers);
 GGML_BACKEND_API void   ggml_backend_cpu_hx_compute(void * engine, int layer,
                                                    const float * x, int64_t x_stride,
                                                    const int32_t * ids, int64_t ids_stride,
@@ -680,6 +909,8 @@ GGML_BACKEND_API void   ggml_backend_cpu_hx_set_router(void * engine, int layer,
 void * ggml_backend_cpu_hx_start(ggml_hx_layer_desc * layers, int n_layers, int n_threads) {
     auto * E = new hx_engine();
     E->n_threads = std::max(1, n_threads);
+    if (E->balance_profile) E->worker_samples.resize(E->n_threads);
+    E->n_primary_layers = n_layers;
     E->layers.resize(n_layers);
     for (int i = 0; i < n_layers; ++i) {
         if (!layers[i].mbox) {
@@ -696,11 +927,9 @@ void * ggml_backend_cpu_hx_start(ggml_hx_layer_desc * layers, int n_layers, int 
         E->max_embd = std::max(E->max_embd, layers[i].n_embd);
     }
     E->h.resize((size_t) GGML_HX_MAX_TOKENS * GGML_HX_MAX_USED * std::max<int64_t>(E->max_ff, 1));
+    E->expert_output.resize((size_t) GGML_HX_MAX_TOKENS * GGML_HX_MAX_USED * std::max<int64_t>(E->max_embd, 1));
     hx_pf_init(*E);
-    E->threads.emplace_back(hx_leader, E);
-    for (int i = 1; i < E->n_threads; ++i) {
-        E->threads.emplace_back(hx_worker, E, i);
-    }
+    hx_resume(*E);
     GGML_LOG_INFO("%s: HX CPU expert engine started: %d layers, %d threads, kernels level %d, prefetch %d experts/layer\n",
                   __func__, n_layers, E->n_threads, hx_kernel_level(), E->pf_k);
     return E;
@@ -709,10 +938,7 @@ void * ggml_backend_cpu_hx_start(ggml_hx_layer_desc * layers, int n_layers, int 
 void ggml_backend_cpu_hx_stop(void * engine) {
     auto * E = (hx_engine *) engine;
     if (!E) return;
-    E->stop.store(true);
-    for (auto & t : E->threads) {
-        t.join();
-    }
+    hx_pause(*E);
     GGML_LOG_INFO("%s: HX CPU expert engine stopped: %llu tasks, %.1f ms busy\n", __func__,
                   (unsigned long long) E->n_tasks.load(), E->busy_ns.load() / 1e6);
     if (E->pf_k) {
@@ -723,6 +949,36 @@ void ggml_backend_cpu_hx_stop(void * engine) {
                       (unsigned long long) E->pred_router.load());
     }
     delete E;
+}
+
+// Attach/detach are setup operations. The caller must synchronize all contexts using this pool.
+int ggml_backend_cpu_hx_attach(void * engine, ggml_hx_layer_desc * layers, int n_layers) {
+    auto * E = (hx_engine *) engine;
+    if (!E || !layers || n_layers <= 0) return -1;
+    std::vector<hx_layer> extra(n_layers);
+    for (int i = 0; i < n_layers; ++i) {
+        if (!layers[i].mbox || !hx_init_layer(extra[i], layers[i])) return -1;
+    }
+    hx_pause(*E);
+    const int first = (int) E->layers.size();
+    E->layers.insert(E->layers.end(), extra.begin(), extra.end());
+    for (const auto & L : extra) {
+        E->max_ff = std::max(E->max_ff, L.d.n_ff);
+        E->max_embd = std::max(E->max_embd, L.d.n_embd);
+    }
+    E->h.resize((size_t) GGML_HX_MAX_TOKENS * GGML_HX_MAX_USED * E->max_ff);
+    E->expert_output.resize((size_t) GGML_HX_MAX_TOKENS * GGML_HX_MAX_USED * E->max_embd);
+    hx_resume(*E);
+    return first;
+}
+
+void ggml_backend_cpu_hx_detach(void * engine, int first, int n_layers) {
+    auto * E = (hx_engine *) engine;
+    GGML_ASSERT(E && first >= E->n_primary_layers && n_layers > 0 && first + n_layers <= (int) E->layers.size());
+    hx_pause(*E);
+    for (int i = first; i < first + n_layers; ++i) E->layers[i] = hx_layer();
+    while ((int) E->layers.size() > E->n_primary_layers && !E->layers.back().d.mbox) E->layers.pop_back();
+    hx_resume(*E);
 }
 
 // synchronous single-thread reference path (used when the op runs on the CPU backend)

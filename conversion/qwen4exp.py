@@ -95,8 +95,8 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         ratio = hp["indexer_compress_ratio"]
         layer_types = hp["layer_types"]
         ratios = [ratio if layer_types[i] == "full_attention" else 0 for i in range(n_layer)]
-        # 0 selects dense, which is how the MTP block attends.
-        ratios += [0] * (self.block_count - n_layer)
+        # MTP full-attention blocks also use the checkpoint's QSA indexer.
+        ratios += [ratio] * (self.block_count - n_layer)
         self.gguf_writer.add_attention_compress_ratios(ratios)
 
         # ple_layer_ids is 1-based in the HF config; empty means no n-gram table

@@ -2540,6 +2540,22 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
         // checks
         default:
             {
+                const char * mtp_dense_env = std::getenv("LLAMA_MTP_DENSE_ATTN");
+                const bool mtp_qsa = params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && arch == LLM_ARCH_QWEN4EXP &&
+                    !(mtp_dense_env && std::string(mtp_dense_env) == "1") &&
+                    hparams.dsv4_compress_ratios[hparams.n_layer()] > 0;
+                if (mtp_qsa) {
+                    auto filter = [&](uint32_t il) { return il >= hparams.n_layer(); };
+                    res = new llama_memory_hybrid_idx(
+                        *this, params.type_k, params.type_v, !cparams.flash_attn,
+                        cparams.n_ctx_seq, 1, hparams.n_swa, hparams.swa_type,
+                        GGML_TYPE_F32, GGML_TYPE_F32, 1,
+                        cparams.n_seq_max, 0, cparams.offload_kqv, cparams.kv_unified,
+                        filter, nullptr, filter, false);
+                    LLAMA_LOG_INFO("%s: MTP QSA cache enabled (attention + indexer, no recurrent state)\n", __func__);
+                    break;
+                }
+
                 // Dense MTP heads use a plain attention KV cache instead of the hybrid wrapper.
                 const bool mtp_on_hybrid_qwen =
                     params.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
