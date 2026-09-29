@@ -1,126 +1,72 @@
-# llama.cpp
+# llama.cpp-hx
 
-![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
+**本项目是 [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) 的 HX 衍生分支（fork）**，面向 Windows + AMD Radeon 的 CPU/GPU 混合 MoE 推理。它基于 llama.cpp v0.5.0，保留上游 Git 历史、MIT 许可证和作者声明。HX 的本地改动由本仓库维护，不代表上游已经合并或支持这些功能。
 
-<div align="center">
+**This is an HX fork of llama.cpp**, based on v0.5.0, for experimental hybrid CPU/GPU MoE inference on Windows and AMD Radeon. Upstream history and licensing are preserved. See [the original llama.cpp README](README-upstream.md) for general project information.
 
-<b>LLM inference in C/C++</b>
+## HX 做什么
 
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![Release](https://img.shields.io/github/v/release/ggml-org/llama.cpp?filter=v*&color=brightgreen)](https://github.com/ggml-org/llama.cpp/releases?q=tag:v0)
-[![Nightly](https://img.shields.io/github/v/release/ggml-org/llama.cpp?label=nightly&filter=b*&color=orange)](https://github.com/ggml-org/llama.cpp/releases?q=b)
-[![Server](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/server.yml?label=Server)](https://github.com/ggml-org/llama.cpp/actions/workflows/server.yml)
-[![Docker](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/docker.yml?label=Docker)](https://github.com/ggml-org/llama.cpp/actions/workflows/docker.yml)
-[![Winget](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/winget.yml?label=Winget)](https://github.com/ggml-org/llama.cpp/actions/workflows/winget.yml)
+- GPU 执行注意力、路由、共享专家及可配置数量的路由专家；CPU 专用线程池执行其余路由专家。
+- CPU/GPU 通过固定页内存中的 mailbox 交接任务与结果；UEPT 管理专家在主存中的放置、GPU 访问和可选显存缓存。
+- 提供 MXFP4 的 AVX-512 CPU 内核、专家并行与预取，以及可选的 MTP 草稿执行优化。
+- 保留 llama.cpp 命令行工具和 `llama-server`。HX 需要显式启用；仅编译源码不会自动应用本文的运行配置。
 
-[ggml](https://github.com/ggml-org/ggml) / [ops](https://github.com/ggml-org/llama.cpp/blob/master/docs/ops.md) / [maintainer PRs](https://github.com/ggml-org/llama.cpp/issues?q=is%3Apr%20is%3Aopen%20draft%3AFalse%20(author%3Argerganov%20OR%20author%3AKitaitiMakoto%20OR%20author%3Adanbev%20OR%20author%3Aaldehir%20OR%20author%3Amax-krasnyansky%20OR%20author%3ACISC%20OR%20author%3Aggerganov%20OR%20author%3Aam17an%20OR%20author%3Ajhen0409%20OR%20author%3Abartowski1182%20OR%20author%3Anikwen%20OR%20author%3Ahipudding%20OR%20author%3Aravi9%20OR%20author%3AServeurpersoCom%20OR%20author%3Apwilkin%20OR%20author%3Areeselevine%20OR%20author%3Angxson%20OR%20author%3Ajeffbolznv%20OR%20author%3Amarty1885%20OR%20author%3A0cc4m%20OR%20author%3ATitaniumtown%20OR%20author%3Aangt%20OR%20author%3AIMbackK%20OR%20author%3Aarthw%20OR%20author%3AJohannesGaessler%20OR%20author%3AORippler%20OR%20author%3Aruixiang63%20OR%20author%3Axctan%20OR%20author%3Aallozaur%20OR%20author%3Ayomaytk%20OR%20author%3Aaendk%20OR%20author%3Awine99%20OR%20author%3Agaugarg-nv%20OR%20author%3Ataronaeo%20OR%20author%3Aforforever73%20OR%20author%3Alhez%20OR%20author%3Anetrunnereve%20OR%20author%3Afairydreaming)%20sort%3Aupdated-desc) / [dev stats](https://github.com/ggml-org/llama.cpp-dev) / [lib llama API](https://github.com/ggml-org/llama.cpp/issues/9289) / [llama-server REST API](https://github.com/ggml-org/llama.cpp/issues/9291)
+主要验证环境为 **Windows、Ryzen 7 9800X3D、RX 9070 XT 16 GiB（gfx1201）、192 GiB RAM**，模型为 Qwen3.8-Flash-Next MXFP4，非专家 FP8 部分转为 Q8_0 存储。其他硬件、模型和操作系统需要自行验证；上游的兼容范围不等同于 HX 的实测范围。
 
-</div>
+## 分支与版本
 
-## Quick start
+| 分支 | 用途 | 对应冻结源码 |
+|---|---|---|
+| `main` | Cache3G 生产方案对应源码，优先考虑生成速度 | `v050-schedule-opt-20260925` |
+| `hx-mtp1` | 可选 MTP1；增加小批量主模型直接验证路径 | `v050-graph-diagnosis-20260925` |
+| `hx-v050-base` | 原始 HX + UEPT + r10 + MTP 移植提交 | `3ad2c2ca45a86abd1c535f537ad9c427f4401a46` |
+| `master` | 创建 Fork 时保留的上游分支 | 不代表 HX 发布版本 |
 
-A few options to get `llama.cpp` installed on your machine:
+基线为 llama.cpp **`7fe450e19305b828c199d602c23a8337aaa1f03b`（v0.5.0）**，包含 [PR #28243](https://github.com/ggml-org/llama.cpp/pull/28243) 在 `6fcaa16f` 时的 MTP 工作。来源、分支差异及 SHA-256 清单见 [来源与许可证](docs/hx/PROVENANCE.md)。这不是对上游最新版本的同步承诺。
 
-- Visit https://llama.app and follow the instructions
-- Run with Docker - see our [Docker documentation](docs/docker.md)
-- Download pre-built binaries from the [releases page](https://github.com/ggml-org/llama.cpp/releases)
-- Build from source by cloning this repository - check out [our build guide](docs/build.md)
+## 开始使用
 
-Once installed:
-
-```sh
-# Download and run a model directly from Hugging Face
-llama cli -hf ggml-org/Qwen3.5-0.8B-GGUF
-
-# Launch OpenAI-compatible API server
-llama serve -hf ggml-org/Qwen3.5-0.8B-GGUF
+```powershell
+git clone --branch main https://github.com/vickywong020/llama.cpp-hx.git
+Set-Location llama.cpp-hx
 ```
 
-<table align="center">
-    <tr>
-        <td align="center" width=50%>
-            <img width="1310" height="888" alt="VLM session with `llama cli`" src="https://github.com/user-attachments/assets/88726b48-1713-48aa-a525-95a02e78afc4" />
-            <i>VLM session with <b>llama cli</b></i>
-        </td>
-        <td align="center">
-            <img width="1392" height="958" alt="Built-in web UI against `llama serve` running Qwen 3.6" src="https://github.com/user-attachments/assets/b402f972-2e32-4def-8771-8d849f08cf2e" />
-            <i>Built-in web UI against <b>llama serve</b></i>
-        </td>
-    </tr>
-<table>
+1. 按 [Windows 构建说明](docs/hx/BUILD-WINDOWS.md) 编译主程序、CPU 和 HIP 后端。
+2. 从 **[魔搭社区 ModelScope](https://modelscope.cn)** 准备模型及配套文件，核对 revision、文件大小和可用的 SHA-256。
+3. 按 [运行配置](docs/hx/USAGE.md) 设置 HX 环境变量，用本地 GGUF 路径启动服务。
+4. 对照 [测试结果与限制](docs/hx/BENCHMARKS.md) 判断配置是否适合自己的输入长度和硬件。
 
-## Description
+仓库不附带推理模型权重或预编译 ROCm 运行库。所有模型权重、量化分片、MTP 文件和视觉投影器统一从 ModelScope 获取；没有所需版本时停止并说明，不自动切换来源或模型。断点续传不得拼接不同来源的缓存。源码、编译工具及 Python/ROCm 依赖可使用其官方来源。上游保留文档中可能介绍其他模型下载方式；本 HX 项目的使用约定以本段为准。
 
-The main goal of `llama.cpp` is to enable LLM (and VLM) inference with minimal setup and state-of-the-art performance on
-a wide range of hardware - locally and in the cloud.
+## 已有测量
 
-- Plain C/C++ implementation without any dependencies
-- Apple silicon is a first-class citizen - optimized via ARM NEON, Accelerate and Metal frameworks
-- AVX, AVX2, AVX512 and AMX support for x86 architectures
-- RVV, ZVFH, ZFH, ZICBOP and ZIHINTPAUSE support for RISC-V architectures
-- 1.5-bit, 2-bit, 3-bit, 4-bit, 5-bit, 6-bit, and 8-bit integer quantization for faster inference and reduced memory use
-- Custom CUDA kernels for running LLMs on NVIDIA GPUs (support for AMD GPUs via HIP and Moore Threads GPUs via MUSA)
-- Vulkan and SYCL backend support
-- CPU+GPU hybrid inference to partially accelerate models larger than the total VRAM capacity
+2026-09-25 同机串行测试，预留 262144 token 容量，固定 WikiText 输入、129 token 输出，各项取中位数：
 
-The `llama.cpp` project is build on top of the [ggml](https://github.com/ggml-org/ggml) library.
+| 方案 | 2K 输入后生成 token/s | 8K 输入后生成 token/s | 2K 首字秒 | 8K 首字秒 |
+|---|---:|---:|---:|---:|
+| Cache3G | 28.36 | 26.58 | 7.57 | 29.34 |
+| MTP1 | 27.05 | 26.46 | 5.38 | 20.95 |
+| 历史 P2A 对照 | 25.63 | 24.87 | 3.70 | 14.23 |
 
-## Supported backends
+这是完整配置之间的测量，**不是 HX 单一算子的加速比例**。Cache3G 的生成较快，但长提示首字等待更久；8K 生成与 MTP1 的差距约 0.5%，不足以证明稳定领先。262144 是预留容量，不表示实际填满 256K 后仍有上述速度。本次源码发布没有重新运行性能测试。
 
-| Backend | Target devices |
-| --- | --- |
-| [BLAS](docs/build.md#blas-build) | All |
-| [BLIS](docs/backend/BLIS.md) | All |
-| [CANN](docs/build.md#cann) | Ascend NPU |
-| [CUDA](docs/build.md#cuda) | Nvidia GPU |
-| [HIP](docs/build.md#hip) | AMD GPU |
-| [Hexagon](docs/backend/snapdragon/README.md) | Snapdragon |
-| [IBM zDNN](docs/backend/zDNN.md) | IBM Z & LinuxONE |
-| [MUSA](docs/build.md#musa) | Moore Threads GPU |
-| [Metal](docs/build.md#metal-build) | Apple Silicon |
-| [OpenCL](docs/backend/OPENCL.md) | Adreno GPU |
-| [OpenVINO [In Progress]](docs/backend/OPENVINO.md) | Intel CPUs, GPUs, and NPUs |
-| [RPC](https://github.com/ggml-org/llama.cpp/tree/master/tools/rpc) | All |
-| [SYCL](docs/backend/SYCL.md) | Intel GPU |
-| [VirtGPU](docs/backend/VirtGPU.md) | VirtGPU APIR |
-| [Vulkan](docs/build.md#vulkan) | GPU |
-| [WebGPU](docs/build.md#webgpu) | All |
-| [ZenDNN](docs/build.md#zendnn) | AMD CPU |
+## 源码地图
 
-## Documentation
+| 路径 | 内容 |
+|---|---|
+| `ggml/include/ggml-hx.h` | HX mailbox 协议与接口 |
+| `ggml/src/ggml-cpu/hx-moe.cpp` | CPU 专家线程池、调度与预取 |
+| `ggml/src/ggml-cpu/arch/x86/hx-mxfp4-avx512.h` | MXFP4 AVX-512 内核 |
+| `ggml/src/ggml-cuda/hx.cu` | GPU 侧 mailbox 与协作 |
+| `ggml/src/ggml-cuda/uept.cu` | 专家放置、缓存与 GPU 执行 |
+| `src/llama-context.cpp`、`src/llama-hx.h` | HX 生命周期与模型上下文 |
+| `src/models/qwen4exp.cpp`、`common/speculative.cpp` | 模型图与 MTP 逻辑 |
+| `docs/development/uept-api.md` | UEPT 接口说明 |
 
-#### Tools
+`ggml-cuda` 中的相关源文件也用于 HIP 构建，目录名不表示只用于 NVIDIA。
 
-- [cli](tools/cli/README.md)
-- [completion](tools/completion/README.md)
-- [server](tools/server/README.md)
-- [GBNF grammars](grammars/README.md)
+## 许可与贡献
 
-#### Development
+主体源码遵循 [MIT License](LICENSE)，第三方组件遵循各自许可证，见 `licenses/`、`vendor/` 及相应子目录。模型许可证独立于源码许可证。感谢 llama.cpp、ggml 和 PR #28243 的贡献者。
 
-- [How to build](docs/build.md)
-- [Running on Docker](docs/docker.md)
-- [Build on Android](docs/android.md)
-- [Multi-GPU usage](docs/multi-gpu.md)
-- [Performance troubleshooting](docs/development/token_generation_performance_tips.md)
-- [GGML tips & tricks](https://github.com/ggml-org/llama.cpp/wiki/GGML-Tips-&-Tricks)
-- [XCFramework](docs/xcframework.md)
-- [Completions](docs/completions.md)
-- [Models](docs/models.md)
-- [Release process](docs/release.md)
-
-## Contributing
-
-- Contributors can open PRs
-- Collaborators will be invited based on contributions
-- Maintainers can push to branches in the `llama.cpp` repo and merge PRs into the `master` branch
-- Any help with managing issues, PRs and projects is very appreciated!
-- Read the [CONTRIBUTING.md](CONTRIBUTING.md) for more information
-
-## Acknowledgements
-
-- [yhirose/cpp-httplib](https://github.com/yhirose/cpp-httplib) - Single-header HTTP server, used by `llama-server` - MIT license
-- [nothings/stb](https://github.com/nothings/stb) - Single-header image format decoder, used by multimodal subsystem - Public domain
-- [nlohmann/json](https://github.com/nlohmann/json) - Single-header JSON library, used by various tools/examples - MIT License
-- [mackron/miniaudio](https://github.com/mackron/miniaudio) - Single-header audio format decoder, used by multimodal subsystem - Public domain
-- [sheredom/subprocess.h](https://github.com/sheredom/subprocess.h) - Single-header process launching solution for C and C++ - Public domain
+HX 问题和改进优先提交到本 Fork；向上游贡献时遵循上游 [CONTRIBUTING.md](CONTRIBUTING.md)。本次整理借助 Codex 完成源码核对与说明文档，推理实现保持冻结快照内容。

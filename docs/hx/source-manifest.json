@@ -1,0 +1,301 @@
+{
+  "schema_version": 1,
+  "upstream": "https://github.com/ggml-org/llama.cpp",
+  "upstream_commit": "7fe450e19305b828c199d602c23a8337aaa1f03b",
+  "hx_base_commit": "3ad2c2ca45a86abd1c535f537ad9c427f4401a46",
+  "snapshot": "v050-schedule-opt-20260925",
+  "profile": "Cache3G",
+  "export_date": "2026-09-29",
+  "files": [
+    {
+      "path": "common/arg.cpp",
+      "bytes": 222241,
+      "sha256": "b6233c5fe77ed79640a77f88d4f319f83a9e8e9feb355c1ba68578436ef057f0"
+    },
+    {
+      "path": "common/common.cpp",
+      "bytes": 79841,
+      "sha256": "925a298e62e20529494e6704f0211a212cf5a94f83f09568da0d93e73abbfcdb"
+    },
+    {
+      "path": "common/common.h",
+      "bytes": 51246,
+      "sha256": "6d2079a5716cbc09e238b294079cbc2138e91e70d187fee7d2467c0a972276c5"
+    },
+    {
+      "path": "common/speculative.cpp",
+      "bytes": 131534,
+      "sha256": "808a78f06faf59bdc07414744b81e9cc436d2c4e3098eb76bbc8387511f7a514"
+    },
+    {
+      "path": "conversion/bailingmoe3.py",
+      "bytes": 9105,
+      "sha256": "6bc667dc4f9c3675170be6a1153cd0e9b06b3cc705f0c285eaa1c3c429fa0f48"
+    },
+    {
+      "path": "conversion/base.py",
+      "bytes": 146573,
+      "sha256": "f1dd98c1864a7287ade096ee008792b8572fa44e5909037e9b96565e8bc942d2"
+    },
+    {
+      "path": "conversion/command_r.py",
+      "bytes": 8218,
+      "sha256": "dbb2746155eff8ff701a41b45afc51c348f6a167a9d76a0185fb0f3163a17b7d"
+    },
+    {
+      "path": "conversion/dots3.py",
+      "bytes": 16944,
+      "sha256": "f934ff8d538d1652562b04757d9fb8a4e47b0c2325d8a2e9c48bf04dd2215a87"
+    },
+    {
+      "path": "conversion/glm.py",
+      "bytes": 18503,
+      "sha256": "9a51581072e42989c28b3bd01a5dfe70b56743807da370ccc6e25dfb8ff98ba4"
+    },
+    {
+      "path": "conversion/qwen.py",
+      "bytes": 40946,
+      "sha256": "69442623bc47828f675ba798cd596708934ee313c8b5dc3e11afcb5eb0af77f4"
+    },
+    {
+      "path": "conversion/qwen4exp.py",
+      "bytes": 10038,
+      "sha256": "4210c656f281ee1c09a7a74b173975b2efb7efc9b4fc030f1d6b800c3d4e9212"
+    },
+    {
+      "path": "convert_hf_to_gguf.py",
+      "bytes": 13529,
+      "sha256": "950ff6e09e14111e04155142ed5194fd3f9a80b6c206510d81e9b1253bab06be"
+    },
+    {
+      "path": "docs/development/uept-api.md",
+      "bytes": 5408,
+      "sha256": "6af272899073c904c3eeddb4e87696d2d52f14e5023d0ecffbab44a7ee7a6466"
+    },
+    {
+      "path": "ggml/include/ggml-hx.h",
+      "bytes": 4283,
+      "sha256": "d3539997edef31a129dd55bc6a6d7efede3889edbc96899b5122611ef2dd1103"
+    },
+    {
+      "path": "ggml/src/ggml-cpu/CMakeLists.txt",
+      "bytes": 30216,
+      "sha256": "0fe7a7fbdca1687cb0bdad1bb3695d2f1808a76617db639bd21f9fdd7219d2db"
+    },
+    {
+      "path": "ggml/src/ggml-cpu/arch/x86/hx-mxfp4-avx512.h",
+      "bytes": 19821,
+      "sha256": "a802db74ef4a38a1e78a0af3bc5c5337c8931e0e7dd032aab77892ea3edbbce9"
+    },
+    {
+      "path": "ggml/src/ggml-cpu/arch/x86/quants.c",
+      "bytes": 211062,
+      "sha256": "69cf574fef8eec2dbddaf4fe0551700b0e7eac786db96c3f3d203265075ad168"
+    },
+    {
+      "path": "ggml/src/ggml-cpu/ggml-cpu.cpp",
+      "bytes": 26427,
+      "sha256": "ed28375a6a617b957d8a95855e6916f74fd425f3865d3a0a26f98e9467984194"
+    },
+    {
+      "path": "ggml/src/ggml-cpu/hx-moe.cpp",
+      "bytes": 47819,
+      "sha256": "5e571977a25dff13f77ae532a8367da67102813c9a46755316cab43fe4b3145a"
+    },
+    {
+      "path": "ggml/src/ggml-cuda/common.cuh",
+      "bytes": 65416,
+      "sha256": "bf7dd2367059f2adfba6593bd843f1ed539c42204c30b0ac8e2b8d7bd97a4445"
+    },
+    {
+      "path": "ggml/src/ggml-cuda/ggml-cuda.cu",
+      "bytes": 249708,
+      "sha256": "b969cb151603c1ed4d92519fc64ac6d88cfbdede21dd57e1e0504951b4be19fe"
+    },
+    {
+      "path": "ggml/src/ggml-cuda/hx.cu",
+      "bytes": 11352,
+      "sha256": "ab0c918d9ed242945e3937408e795cd547a0e68fbb8d2a96fe6259c2349a2160"
+    },
+    {
+      "path": "ggml/src/ggml-cuda/hx.cuh",
+      "bytes": 385,
+      "sha256": "386c4e25827721b9a1e3ea6411fd24899f516853b9a558382774c6525b69aab2"
+    },
+    {
+      "path": "ggml/src/ggml-cuda/mmq.cu",
+      "bytes": 16542,
+      "sha256": "7ca077af13337ce830de36a21ce89dc1cfda2dd0fc6c03768ae077e3ce2a8a95"
+    },
+    {
+      "path": "ggml/src/ggml-cuda/mmq.cuh",
+      "bytes": 72601,
+      "sha256": "33ac0bdc1c3b882fe24bbf2f5d9e8165118f97cfe5fecf0a41e9be5a2aa19c39"
+    },
+    {
+      "path": "ggml/src/ggml-cuda/mmvq.cu",
+      "bytes": 77334,
+      "sha256": "f7a33e5aa132cf50013734354e8570f2a33dbba7dc671b9ce793c0ee2bad6137"
+    },
+    {
+      "path": "ggml/src/ggml-cuda/uept-mmvq.cuh",
+      "bytes": 1098,
+      "sha256": "d229ec7005e6c6f593f67cd445edeb637c45c87b9b27bf362ec5bf7af6dbf487"
+    },
+    {
+      "path": "ggml/src/ggml-cuda/uept-test.cuh",
+      "bytes": 18167,
+      "sha256": "592e117cc4b7d3f28490ece423ccc863337432a0dd8f6d9a2797adc6bbad4efd"
+    },
+    {
+      "path": "ggml/src/ggml-cuda/uept.cu",
+      "bytes": 45876,
+      "sha256": "30cfdc98905f7bf66efb99f1dad9d3f298302734ee81643d703ab6a3cb73913a"
+    },
+    {
+      "path": "ggml/src/ggml-cuda/uept.cuh",
+      "bytes": 2418,
+      "sha256": "e82eede90e4bb70ac2a3fa0a258b00d064b62c0dab961a516a02d73c080e1f5f"
+    },
+    {
+      "path": "gguf-py/gguf/constants.py",
+      "bytes": 234503,
+      "sha256": "28e742d042181ed6183c3433fa89a25420409e5ed0b83944edb2d3f0e7aa2a06"
+    },
+    {
+      "path": "gguf-py/gguf/tensor_mapping.py",
+      "bytes": 134453,
+      "sha256": "f41c50d2f2bca5da13694dab43f5f63f4b658f0cc8195cdffa90786f7ccfe001"
+    },
+    {
+      "path": "include/llama.h",
+      "bytes": 88035,
+      "sha256": "9bf3fde373b7c3d8aff82d13ed304fee4ed2b483af7d262514f84cbad250e4e2"
+    },
+    {
+      "path": "src/llama-arch.cpp",
+      "bytes": 83329,
+      "sha256": "3b6fb72ec7d99914f396c6bedef59f339c37d793759ca8eda60f6bb75cf20556"
+    },
+    {
+      "path": "src/llama-arch.h",
+      "bytes": 23709,
+      "sha256": "5f1c3d1624530a7a8680e43ab191abb11fd1644e48c881e863e3dd8f5efab20f"
+    },
+    {
+      "path": "src/llama-context.cpp",
+      "bytes": 173931,
+      "sha256": "5d0f5e672e9bc1c261be51ef876e0015c764d2828f0055aec4fef554db2a080f"
+    },
+    {
+      "path": "src/llama-context.h",
+      "bytes": 13611,
+      "sha256": "ba646e7c381b9b09554cb127dbb5665fc8a62080b19cb2de88057afac6269fc0"
+    },
+    {
+      "path": "src/llama-graph.cpp",
+      "bytes": 146989,
+      "sha256": "d7c5ab496050053802abf5cd10022e3aab6c0641f8c658cc2d446ec0c3ac0f86"
+    },
+    {
+      "path": "src/llama-graph.h",
+      "bytes": 49465,
+      "sha256": "ef846008fdee44c6190082ebb50761ee7cdfdff1bc9df59653e49b366bec8cae"
+    },
+    {
+      "path": "src/llama-hx.h",
+      "bytes": 1427,
+      "sha256": "42df208b8c7c8f3d2d74b367b2fdb69d8be28c97b43e8977f1c3119f02ba781c"
+    },
+    {
+      "path": "src/llama-memory-hybrid-idx.cpp",
+      "bytes": 24238,
+      "sha256": "be60da882ca67b78720d10917724734aea249a0ec0bcda38b19edb37fc2f49f6"
+    },
+    {
+      "path": "src/llama-memory-hybrid-idx.h",
+      "bytes": 6293,
+      "sha256": "7c3ebd5fc7e087af55c147516f28d7bf0c869d741789747032d9974039c2d3f8"
+    },
+    {
+      "path": "src/llama-memory-hybrid.cpp",
+      "bytes": 10169,
+      "sha256": "0147ae0e99c66483f803e2fac7bd08d43f312731d6aed493e875405b8662c6fd"
+    },
+    {
+      "path": "src/llama-memory-hybrid.h",
+      "bytes": 4428,
+      "sha256": "9f4d3346c1cea5acf8172facc18010582bd4cfcc42ea8b405eab25d5b08bf32b"
+    },
+    {
+      "path": "src/llama-model-loader.cpp",
+      "bytes": 80410,
+      "sha256": "8928fb5304d8cf4adedf0124cd02826b6f2d4e581a382f6c52ac0cde00ff7bc2"
+    },
+    {
+      "path": "src/llama-model-loader.h",
+      "bytes": 9614,
+      "sha256": "963419d13497803f15d4317a025b6ad3163f3d3d973c3994e7b2a95c954ecfc6"
+    },
+    {
+      "path": "src/llama-model.cpp",
+      "bytes": 157223,
+      "sha256": "5aedf3802c9eceda17cba96b3c16822afbf8bbcff3ab66a4a3bde730ab70e96d"
+    },
+    {
+      "path": "src/llama-model.h",
+      "bytes": 32676,
+      "sha256": "2fa2f875f2ca5bdf9212b4b3fe80e4efd5e2889873951dc16dedb45a62916691"
+    },
+    {
+      "path": "src/llama.cpp",
+      "bytes": 23893,
+      "sha256": "822838abd4e952e4ce62c3747503697087ef43105bac99d30261585c1cca3551"
+    },
+    {
+      "path": "src/models/models.h",
+      "bytes": 105156,
+      "sha256": "c59cc5322177a910db91deb55582e02398f93d85c01f8bbcdf88e73e5f057f46"
+    },
+    {
+      "path": "src/models/qwen4exp.cpp",
+      "bytes": 76779,
+      "sha256": "28911d4d95c05638280ce8c6bd22a2aef9fb7ddbdf54eb7422eeb7c72fa20467"
+    },
+    {
+      "path": "tests/test-arg-parser.cpp",
+      "bytes": 19007,
+      "sha256": "a5660ac75da30a949d2e3397f02e125a39ca845529cea07830c746cfd4e44c69"
+    },
+    {
+      "path": "tools/server/README.md",
+      "bytes": 107290,
+      "sha256": "42cc28065b67323265c87cec0391ee0e55186997aea7dbe6277bab1b5d409bb0"
+    },
+    {
+      "path": "tools/server/server-context.cpp",
+      "bytes": 234602,
+      "sha256": "b7c588e157c241253dc3691f2308478d6660ea7edb63ef6f517785bfb72ec38c"
+    },
+    {
+      "path": "tools/server/server-schema.cpp",
+      "bytes": 33291,
+      "sha256": "5649eade243d04496c11cd0b8c7d6caad931dd26ba564915cb3be9507ea0a7ee"
+    },
+    {
+      "path": "tools/server/server-task.cpp",
+      "bytes": 67862,
+      "sha256": "199fc97b357eb798af031ad0f7ea54aa503a89f25fa14d868909744c7cd9bde9"
+    },
+    {
+      "path": "tools/server/server-task.h",
+      "bytes": 18512,
+      "sha256": "f23be64e5cb782779a19bf6b4f2d830e06a790fceb1213b199e38f1f82fd231a"
+    },
+    {
+      "path": "tools/server/tests/unit/test_metrics.py",
+      "bytes": 9722,
+      "sha256": "181b9f52d1e0ddea739b7ac57d7da87e868813af6c624a08fff1de53d93fcac0"
+    }
+  ]
+}
