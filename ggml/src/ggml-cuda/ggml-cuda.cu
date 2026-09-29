@@ -2657,6 +2657,20 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
 
     graph->uid = cgraph->uid;
 
+    static const bool trace_diff = getenv("LLAMA_VERIFY_GRAPH_DIFF") != nullptr;
+    int trace_n = 0;
+    if (trace_diff) {
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            if (ggml_cuda_hx_is_op(cgraph->nodes[i])) {
+                trace_n = (int) cgraph->nodes[i]->ne[1];
+                break;
+            }
+        }
+    }
+    const bool trace = trace_n > 0 && trace_n <= 8;
+    const int old_nodes = (int) graph->node_props.size();
+    int diffs = 0, op = 0, shape = 0, data = 0, src_shape = 0, src_data = 0, params = 0, tensor_ptr = 0, metadata = 0;
+
     // Check if the graph size has changed
     if ((int)graph->node_props.size() != cgraph->n_nodes) {
         res = true;
@@ -2675,12 +2689,37 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
             }
         }
 
+        if (trace && i < old_nodes && memcmp(&graph->node_props[i], &prop, sizeof(prop)) != 0) {
+            const auto & previous = graph->node_props[i];
+            const auto & a = previous.node;
+            const auto & b = prop.node;
+            const bool d_op = a.type != b.type || a.op != b.op;
+            const bool d_shape = memcmp(a.ne, b.ne, sizeof(a.ne)) || memcmp(a.nb, b.nb, sizeof(a.nb));
+            const bool d_data = a.data != b.data;
+            const bool d_src_shape = memcmp(previous.node_src_ne, prop.node_src_ne, sizeof(prop.node_src_ne)) ||
+                                     memcmp(previous.node_src_nb, prop.node_src_nb, sizeof(prop.node_src_nb));
+            const bool d_src_data = memcmp(previous.node_src_data_ptrs, prop.node_src_data_ptrs, sizeof(prop.node_src_data_ptrs));
+            const bool d_params = memcmp(a.op_params, b.op_params, sizeof(a.op_params));
+            const bool d_ptr = memcmp(a.src, b.src, sizeof(a.src)) || a.view_src != b.view_src;
+            ++diffs;
+            op += d_op; shape += d_shape; data += d_data; src_shape += d_src_shape;
+            src_data += d_src_data; params += d_params; tensor_ptr += d_ptr;
+            metadata += !(d_op || d_shape || d_data || d_src_shape || d_src_data || d_params);
+            if (diffs <= 3 && old_nodes == cgraph->n_nodes) {
+                GGML_LOG_INFO("VERIFY_GRAPH_NODE n=%d i=%d name=%s op=%d shape=%d data=%d src_shape=%d src_data=%d params=%d tensor_ptr=%d\n",
+                    trace_n, i, b.name, d_op, d_shape, d_data, d_src_shape, d_src_data, d_params, d_ptr);
+            }
+        }
         if (res || memcmp(&graph->node_props[i], &prop, sizeof(prop)) != 0) {
             graph->node_props[i] = prop;
             res = true;
         }
     }
 
+    if (trace) {
+        GGML_LOG_INFO("VERIFY_GRAPH_DIFF n=%d old_nodes=%d nodes=%d changed=%d diffs=%d op=%d shape=%d data=%d src_shape=%d src_data=%d params=%d tensor_ptr=%d metadata_only=%d\n",
+            trace_n, old_nodes, cgraph->n_nodes, res, diffs, op, shape, data, src_shape, src_data, params, tensor_ptr, metadata);
+    }
     return res;
 }
 
@@ -4585,7 +4624,10 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
-    if (graph->is_enabled() && !verify_gpu_profile_enabled()) {
+    static const bool target_no_graph = getenv("LLAMA_VERIFY_TARGET_NO_GRAPH") != nullptr;
+    const int target_n = target_no_graph ? verify_graph_tokens(cgraph) : 0;
+    const bool target_direct = target_n > 0 && target_n <= 8;
+    if (graph->is_enabled() && !verify_gpu_profile_enabled() && !target_direct) {
         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
         if (graph_compatible) {
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);

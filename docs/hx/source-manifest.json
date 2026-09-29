@@ -3,8 +3,8 @@
   "upstream": "https://github.com/ggml-org/llama.cpp",
   "upstream_commit": "7fe450e19305b828c199d602c23a8337aaa1f03b",
   "hx_base_commit": "3ad2c2ca45a86abd1c535f537ad9c427f4401a46",
-  "snapshot": "v050-schedule-opt-20260925",
-  "profile": "Cache3G",
+  "snapshot": "v050-graph-diagnosis-20260925",
+  "profile": "MTP1",
   "export_date": "2026-09-29",
   "files": [
     {
@@ -109,8 +109,8 @@
     },
     {
       "path": "ggml/src/ggml-cuda/ggml-cuda.cu",
-      "bytes": 249708,
-      "sha256": "b969cb151603c1ed4d92519fc64ac6d88cfbdede21dd57e1e0504951b4be19fe"
+      "bytes": 258594,
+      "sha256": "b07695e40da5d4a8940ff75fb7ad77386279b5a99adc7d7cc9b67f85cd62e573"
     },
     {
       "path": "ggml/src/ggml-cuda/hx.cu",
